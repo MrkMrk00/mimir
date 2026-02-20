@@ -163,19 +163,57 @@ func (c *offsetCatalogue) Set(key string, wm offsetWatermark) {
 
 // offsetCompactor wraps a tsdb.Compactor to record the Kafka offset watermark
 // for each newly compacted block in the offset catalogue.
+//
+// It maintains two offset snapshots for rotation: on each compaction tick the
+// caller invokes Rotate with the current committed offset. The previous tick's
+// snapshot becomes the watermark stamped on new blocks, and the fresh value is
+// stored for the next tick. This bounds watermark lag to one compaction interval.
 type offsetCompactor struct {
 	inner     tsdb.Compactor
 	catalogue *offsetCatalogue
-	watermark func() offsetWatermark
+
+	topic     string
+	partition int32
+
+	// compactionOffset is the watermark assigned to blocks produced in the
+	// current tick. Set from the previous tick's preCompactionOffset.
+	compactionOffset int64
+
+	// preCompactionOffset is the committed offset snapshot taken at the start
+	// of the current tick. Becomes compactionOffset at the next Rotate.
+	preCompactionOffset int64
 }
 
 var _ tsdb.Compactor = (*offsetCompactor)(nil)
 
-func newOffsetCompactor(inner tsdb.Compactor, catalogue *offsetCatalogue, watermark func() offsetWatermark) *offsetCompactor {
+func newOffsetCompactor(inner tsdb.Compactor, catalogue *offsetCatalogue, topic string, partition int32, initialOffset int64) *offsetCompactor {
 	return &offsetCompactor{
-		inner:     inner,
-		catalogue: catalogue,
-		watermark: watermark,
+		inner:               inner,
+		catalogue:           catalogue,
+		topic:               topic,
+		partition:           partition,
+		compactionOffset:    initialOffset,
+		preCompactionOffset: initialOffset,
+	}
+}
+
+// Rotate advances the offset rotation. Call before each compaction tick.
+// If currentCommittedOffset is negative (no commit yet), the rotation is
+// skipped and the existing watermark is preserved.
+func (c *offsetCompactor) Rotate(currentCommittedOffset int64) {
+	if currentCommittedOffset < 0 {
+		return
+	}
+	c.compactionOffset = c.preCompactionOffset
+	c.preCompactionOffset = currentCommittedOffset
+}
+
+// Watermark returns the offset watermark that will be stamped on new blocks.
+func (c *offsetCompactor) Watermark() offsetWatermark {
+	return offsetWatermark{
+		Topic:     c.topic,
+		Partition: c.partition,
+		Offset:    c.compactionOffset,
 	}
 }
 
@@ -214,7 +252,7 @@ func (c *offsetCompactor) recordBlocks(ulids []ulid.ULID) {
 	if len(ulids) == 0 {
 		return
 	}
-	wm := c.watermark()
+	wm := c.Watermark()
 	for _, id := range ulids {
 		c.catalogue.Set(id.String(), wm)
 	}

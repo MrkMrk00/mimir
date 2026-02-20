@@ -130,64 +130,59 @@ func (m *mockCompactor) CompactOOO(string, *tsdb.OOOCompactionHead) ([]ulid.ULID
 	return m.oooResult, m.err
 }
 
+func newTestOffsetCompactor(t *testing.T, inner *mockCompactor, initialOffset int64) (*offsetCompactor, *offsetCatalogue) {
+	t.Helper()
+	cat := newOffsetCatalogue(log.NewNopLogger(), t.TempDir(), "tenant-1")
+	c := newOffsetCompactor(inner, cat, "ingest", 0, initialOffset)
+	return c, cat
+}
+
 func TestOffsetCompactor_RecordsBlocks(t *testing.T) {
 	block1 := ulid.MustNew(1, nil)
 	block2 := ulid.MustNew(2, nil)
-	wm := offsetWatermark{Topic: "ingest", Partition: 0, Offset: 500}
 
 	t.Run("Write", func(t *testing.T) {
-		cat := newOffsetCatalogue(log.NewNopLogger(), t.TempDir(), "tenant-1")
-		inner := &mockCompactor{writeResult: []ulid.ULID{block1}}
-		c := newOffsetCompactor(inner, cat, func() offsetWatermark { return wm })
+		c, cat := newTestOffsetCompactor(t, &mockCompactor{writeResult: []ulid.ULID{block1}}, 500)
 
 		ulids, err := c.Write("dest", nil, 0, 100, nil)
 		require.NoError(t, err)
 		assert.Equal(t, []ulid.ULID{block1}, ulids)
-		assert.True(t, inner.writeCalled)
 
 		got, ok := cat.Get(block1.String())
 		require.True(t, ok)
-		assert.Equal(t, wm, got)
+		assert.Equal(t, int64(500), got.Offset)
 	})
 
 	t.Run("Compact", func(t *testing.T) {
-		cat := newOffsetCatalogue(log.NewNopLogger(), t.TempDir(), "tenant-1")
-		inner := &mockCompactor{compactResult: []ulid.ULID{block1, block2}}
-		c := newOffsetCompactor(inner, cat, func() offsetWatermark { return wm })
+		c, cat := newTestOffsetCompactor(t, &mockCompactor{compactResult: []ulid.ULID{block1, block2}}, 500)
 
 		ulids, err := c.Compact("dest", nil, nil)
 		require.NoError(t, err)
 		assert.Equal(t, []ulid.ULID{block1, block2}, ulids)
-		assert.True(t, inner.compactCalled)
 
 		got, ok := cat.Get(block1.String())
 		require.True(t, ok)
-		assert.Equal(t, wm, got)
+		assert.Equal(t, int64(500), got.Offset)
 
 		got, ok = cat.Get(block2.String())
 		require.True(t, ok)
-		assert.Equal(t, wm, got)
+		assert.Equal(t, int64(500), got.Offset)
 	})
 
 	t.Run("CompactOOO", func(t *testing.T) {
-		cat := newOffsetCatalogue(log.NewNopLogger(), t.TempDir(), "tenant-1")
-		inner := &mockCompactor{oooResult: []ulid.ULID{block1}}
-		c := newOffsetCompactor(inner, cat, func() offsetWatermark { return wm })
+		c, cat := newTestOffsetCompactor(t, &mockCompactor{oooResult: []ulid.ULID{block1}}, 500)
 
 		ulids, err := c.CompactOOO("dest", nil)
 		require.NoError(t, err)
 		assert.Equal(t, []ulid.ULID{block1}, ulids)
-		assert.True(t, inner.oooCalled)
 
 		got, ok := cat.Get(block1.String())
 		require.True(t, ok)
-		assert.Equal(t, wm, got)
+		assert.Equal(t, int64(500), got.Offset)
 	})
 
 	t.Run("empty result does not record", func(t *testing.T) {
-		cat := newOffsetCatalogue(log.NewNopLogger(), t.TempDir(), "tenant-1")
-		inner := &mockCompactor{writeResult: nil}
-		c := newOffsetCompactor(inner, cat, func() offsetWatermark { return wm })
+		c, cat := newTestOffsetCompactor(t, &mockCompactor{writeResult: nil}, 500)
 
 		ulids, err := c.Write("dest", nil, 0, 100, nil)
 		require.NoError(t, err)
@@ -198,14 +193,63 @@ func TestOffsetCompactor_RecordsBlocks(t *testing.T) {
 	})
 
 	t.Run("error does not record", func(t *testing.T) {
-		cat := newOffsetCatalogue(log.NewNopLogger(), t.TempDir(), "tenant-1")
-		inner := &mockCompactor{err: assert.AnError}
-		c := newOffsetCompactor(inner, cat, func() offsetWatermark { return wm })
+		c, cat := newTestOffsetCompactor(t, &mockCompactor{err: assert.AnError}, 500)
 
 		_, err := c.Write("dest", nil, 0, 100, nil)
 		require.Error(t, err)
 
 		_, ok := cat.Get(block1.String())
 		assert.False(t, ok)
+	})
+}
+
+func TestOffsetCompactor_Rotate(t *testing.T) {
+	block := ulid.MustNew(1, nil)
+
+	t.Run("initial watermark uses initial offset", func(t *testing.T) {
+		c, _ := newTestOffsetCompactor(t, &mockCompactor{}, 100)
+		wm := c.Watermark()
+		assert.Equal(t, int64(100), wm.Offset)
+		assert.Equal(t, "ingest", wm.Topic)
+		assert.Equal(t, int32(0), wm.Partition)
+	})
+
+	t.Run("first rotate keeps initial offset as watermark", func(t *testing.T) {
+		c, _ := newTestOffsetCompactor(t, &mockCompactor{}, 100)
+		c.Rotate(200)
+		assert.Equal(t, int64(100), c.Watermark().Offset)
+	})
+
+	t.Run("second rotate uses first snapshot", func(t *testing.T) {
+		c, _ := newTestOffsetCompactor(t, &mockCompactor{}, 100)
+		c.Rotate(200)
+		c.Rotate(300)
+		assert.Equal(t, int64(200), c.Watermark().Offset)
+	})
+
+	t.Run("negative offset skips rotation", func(t *testing.T) {
+		c, _ := newTestOffsetCompactor(t, &mockCompactor{}, 100)
+		c.Rotate(-1)
+		assert.Equal(t, int64(100), c.Watermark().Offset)
+	})
+
+	t.Run("negative offset after valid rotation preserves state", func(t *testing.T) {
+		c, _ := newTestOffsetCompactor(t, &mockCompactor{}, 100)
+		c.Rotate(200)
+		c.Rotate(-1)
+		assert.Equal(t, int64(100), c.Watermark().Offset)
+	})
+
+	t.Run("blocks stamped with rotated watermark", func(t *testing.T) {
+		c, cat := newTestOffsetCompactor(t, &mockCompactor{writeResult: []ulid.ULID{block}}, 100)
+		c.Rotate(200)
+		c.Rotate(300)
+
+		_, err := c.Write("dest", nil, 0, 100, nil)
+		require.NoError(t, err)
+
+		got, ok := cat.Get(block.String())
+		require.True(t, ok)
+		assert.Equal(t, int64(200), got.Offset)
 	})
 }
