@@ -13,6 +13,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid/v2"
+	"github.com/prometheus/prometheus/tsdb"
 
 	"github.com/grafana/mimir/pkg/util/atomicfs"
 )
@@ -158,4 +159,63 @@ func (c *offsetCatalogue) Set(key string, wm offsetWatermark) {
 
 	c.data[key] = wm
 	c.dirty = true
+}
+
+// offsetCompactor wraps a tsdb.Compactor to record the Kafka offset watermark
+// for each newly compacted block in the offset catalogue.
+type offsetCompactor struct {
+	inner     tsdb.Compactor
+	catalogue *offsetCatalogue
+	watermark func() offsetWatermark
+}
+
+var _ tsdb.Compactor = (*offsetCompactor)(nil)
+
+func newOffsetCompactor(inner tsdb.Compactor, catalogue *offsetCatalogue, watermark func() offsetWatermark) *offsetCompactor {
+	return &offsetCompactor{
+		inner:     inner,
+		catalogue: catalogue,
+		watermark: watermark,
+	}
+}
+
+func (c *offsetCompactor) Plan(dir string) ([]string, error) {
+	return c.inner.Plan(dir)
+}
+
+func (c *offsetCompactor) Write(dest string, b tsdb.BlockReader, mint, maxt int64, base *tsdb.BlockMeta) ([]ulid.ULID, error) {
+	ulids, err := c.inner.Write(dest, b, mint, maxt, base)
+	if err != nil {
+		return ulids, err
+	}
+	c.recordBlocks(ulids)
+	return ulids, nil
+}
+
+func (c *offsetCompactor) Compact(dest string, dirs []string, open []*tsdb.Block) ([]ulid.ULID, error) {
+	ulids, err := c.inner.Compact(dest, dirs, open)
+	if err != nil {
+		return ulids, err
+	}
+	c.recordBlocks(ulids)
+	return ulids, nil
+}
+
+func (c *offsetCompactor) CompactOOO(dest string, oooHead *tsdb.OOOCompactionHead) ([]ulid.ULID, error) {
+	ulids, err := c.inner.CompactOOO(dest, oooHead)
+	if err != nil {
+		return ulids, err
+	}
+	c.recordBlocks(ulids)
+	return ulids, nil
+}
+
+func (c *offsetCompactor) recordBlocks(ulids []ulid.ULID) {
+	if len(ulids) == 0 {
+		return
+	}
+	wm := c.watermark()
+	for _, id := range ulids {
+		c.catalogue.Set(id.String(), wm)
+	}
 }
