@@ -102,7 +102,7 @@ func newShipper(
 // Sync performs a single synchronization, which ensures all non-compacted local blocks have been uploaded
 // to the object bucket once.
 //
-// It is not concurrency-safe, however it is compactor-safe (running concurrently with compactor is ok).
+// It is not concurrency-safe, however it is tsdbCompactor-safe (running concurrently with tsdbCompactor is ok).
 func (s *shipper) Sync(ctx context.Context) (shipped int, err error) {
 	log, ctx := spanlogger.New(ctx, s.logger, tracer, "Ingester.Shipper.Sync")
 	defer log.Finish()

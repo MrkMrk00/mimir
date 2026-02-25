@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net/http"
@@ -46,6 +47,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/hashcache"
 	"github.com/prometheus/prometheus/tsdb/index"
@@ -2749,6 +2751,41 @@ func (i *Ingester) createTSDB(userID string, walReplayConcurrency int) (*userTSD
 		return userDB.blocksToDelete(blocks)
 	}
 
+	// When ingest storage is enabled, set up the offset catalogue and compactor
+	// wrapper so that compacted blocks are tagged with the Kafka offset watermark.
+	var catalogue *offsetCatalogue
+	var newCompactorFunc tsdb.NewCompactorFunc
+	if i.ingestReader != nil {
+		catalogue = newOffsetCatalogue(userLogger, udir, userID)
+		if err := catalogue.Load(); err != nil {
+			return nil, fmt.Errorf("load offset catalogue: %w", err)
+		}
+
+		var initialOffset int64 = -1
+		if head, ok := catalogue.Get(offsetCatalogueBlockHead); ok {
+			initialOffset = head.Offset
+		}
+
+		topic := i.cfg.IngestStorageConfig.KafkaConfig.Topic
+		partition := i.ingestPartitionID
+
+		newCompactorFunc = func(ctx context.Context, r prometheus.Registerer, l *slog.Logger, ranges []int64, pool chunkenc.Pool, opts *tsdb.Options) (tsdb.Compactor, error) {
+			inner, err := tsdb.NewLeveledCompactorWithOptions(ctx, r, l, ranges, pool, tsdb.LeveledCompactorOptions{
+				MaxBlockChunkSegmentSize:    opts.MaxBlockChunkSegmentSize,
+				EnableOverlappingCompaction: opts.EnableOverlappingCompaction,
+				PD:                          opts.PostingsDecoderFactory,
+				UseUncachedIO:               opts.UseUncachedIO,
+				BlockExcludeFilter:          opts.BlockCompactionExcludeFunc,
+			})
+			if err != nil {
+				return nil, err
+			}
+			oc := newTSDBCompactor(inner, catalogue, topic, partition, initialOffset)
+			userDB.tsdbCompactor = oc
+			return oc, nil
+		}
+	}
+
 	oooTW := i.limits.OutOfOrderTimeWindow(userID)
 	// Create a new user database
 	db, err := tsdb.Open(udir, util_log.SlogFromGoKit(userLogger), tsdbPromReg, &tsdb.Options{
@@ -2786,6 +2823,7 @@ func (i *Ingester) createTSDB(userID string, walReplayConcurrency int) (*userTSD
 		BlockChunkQuerierFunc: func(b tsdb.BlockReader, mint, maxt int64) (storage.ChunkQuerier, error) {
 			return i.createBlockChunkQuerier(userID, b, mint, maxt)
 		},
+		NewCompactorFunc: newCompactorFunc,
 	}, nil)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to open TSDB: %s", udir)
@@ -2803,7 +2841,17 @@ func (i *Ingester) createTSDB(userID string, walReplayConcurrency int) (*userTSD
 		return nil, errors.Wrapf(err, "failed to compact TSDB: %s", udir)
 	}
 
+	if catalogue != nil {
+		blocks := db.Blocks()
+		blockIDs := make([]ulid.ULID, len(blocks))
+		for j, b := range blocks {
+			blockIDs[j] = b.Meta().ULID
+		}
+		catalogue.Prune(blockIDs)
+	}
+
 	userDB.db = db
+	userDB.offsetCatalogue = catalogue
 	userDBHasDB.Store(true)
 	// We set the limiter here because we don't want to limit
 	// series during WAL replay.
@@ -3236,6 +3284,8 @@ func (i *Ingester) compactionServiceRunning(ctx context.Context) error {
 			// clearing the read-only mode. See [Ingester.PrepareInstanceRingDownscaleHandler]
 			i.numCompactionsInProgress.Inc()
 
+			i.rotateCompactionOffsets()
+
 			// The forcedCompactionMaxTime has no meaning because force=false.
 			i.compactBlocks(ctx, false, 0, nil)
 
@@ -3264,6 +3314,8 @@ func (i *Ingester) compactionServiceRunning(ctx context.Context) error {
 			// This is because we want to track the number of compactions accurately before the
 			// downscale handler is called. This ensures that the ingester will never leave the
 			// read-only state. (See [Ingester.FlushHandler])
+
+			i.rotateCompactionOffsets()
 
 			// Always pass math.MaxInt64 as forcedCompactionMaxTime because we want to compact the whole TSDB head.
 			i.compactBlocks(ctx, true, math.MaxInt64, req.users)
@@ -3365,6 +3417,23 @@ func (i *Ingester) timeToNextZoneAwareCompaction(now time.Time, zones []string) 
 	return result
 }
 
+// rotateCompactionOffsets advances the offset rotation on every tenant's
+// tsdbCompactor so that blocks produced in this tick get the previous tick's
+// committed offset as their watermark.
+func (i *Ingester) rotateCompactionOffsets() {
+	if i.ingestReader == nil {
+		return
+	}
+	committedOffset := i.ingestReader.LastCommittedOffset()
+	for _, userID := range i.getTSDBUsers() {
+		db := i.getTSDB(userID)
+		if db == nil || db.tsdbCompactor == nil {
+			continue
+		}
+		db.tsdbCompactor.Rotate(committedOffset)
+	}
+}
+
 // Compacts all compactable blocks. Force flag will force compaction even if head is not compactable yet.
 func (i *Ingester) compactBlocks(ctx context.Context, force bool, forcedCompactionMaxTime int64, allowed *util.AllowList) {
 	defer i.metrics.resetForcedCompactions()
@@ -3433,6 +3502,12 @@ func (i *Ingester) compactBlocks(ctx context.Context, force bool, forcedCompacti
 			level.Warn(i.logger).Log("msg", "TSDB blocks compaction for user has failed", "user", userID, "err", err, "compactReason", reason)
 		} else {
 			level.Debug(i.logger).Log("msg", "TSDB blocks compaction completed successfully", "user", userID, "compactReason", reason)
+		}
+
+		if cat := userDB.offsetCatalogue; cat != nil {
+			if saveErr := cat.Save(); saveErr != nil {
+				level.Warn(i.logger).Log("msg", "failed to save offset catalogue after compaction", "user", userID, "err", saveErr)
+			}
 		}
 
 		minTimeAfter := userDB.Head().MinTime()
@@ -4542,6 +4617,21 @@ func (i *Ingester) NotifyPreCommit(ctx context.Context) error {
 		if db == nil {
 			return nil
 		}
-		return db.Head().FsyncWLSegments()
+		if err := db.Head().FsyncWLSegments(); err != nil {
+			return err
+		}
+
+		if cat := db.offsetCatalogue; cat != nil {
+			cat.Set(offsetCatalogueBlockHead, offsetWatermark{
+				Topic:     i.cfg.IngestStorageConfig.KafkaConfig.Topic,
+				Partition: i.ingestPartitionID,
+				Offset:    i.ingestReader.LastCommittedOffset(),
+			})
+			if err := cat.Save(); err != nil {
+				level.Warn(i.logger).Log("msg", "failed to save offset catalogue", "user", userID, "err", err)
+			}
+		}
+
+		return nil
 	})
 }

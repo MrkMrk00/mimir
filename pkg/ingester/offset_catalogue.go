@@ -63,10 +63,9 @@ func (c *offsetCatalogue) filePath() string {
 	return filepath.Join(c.dir, offsetCatalogueFilename)
 }
 
-// Load reads the catalogue from disk. Entries for blocks not in existingBlocks
-// are pruned (the __head__ entry is always kept). If the file does not exist or
-// is corrupt the catalogue starts empty.
-func (c *offsetCatalogue) Load(existingBlocks []ulid.ULID) error {
+// Load reads the catalogue from disk. If the file does not exist or is corrupt
+// the catalogue starts empty.
+func (c *offsetCatalogue) Load() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -91,20 +90,30 @@ func (c *offsetCatalogue) Load(existingBlocks []ulid.ULID) error {
 		return nil
 	}
 
+	for key, wm := range stored.Data {
+		c.data[key] = wm
+	}
+	return nil
+}
+
+// Prune removes entries for blocks not in existingBlocks. The __head__ entry is
+// always kept.
+func (c *offsetCatalogue) Prune(existingBlocks []ulid.ULID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	existing := make(map[string]struct{}, len(existingBlocks))
 	for _, id := range existingBlocks {
 		existing[id.String()] = struct{}{}
 	}
 
 	pruned := 0
-	for key, wm := range stored.Data {
+	for key := range c.data {
 		if key == offsetCatalogueBlockHead {
-			c.data[key] = wm
 			continue
 		}
-		if _, ok := existing[key]; ok {
-			c.data[key] = wm
-		} else {
+		if _, ok := existing[key]; !ok {
+			delete(c.data, key)
 			pruned++
 		}
 	}
@@ -113,8 +122,6 @@ func (c *offsetCatalogue) Load(existingBlocks []ulid.ULID) error {
 		c.dirty = true
 		level.Info(c.logger).Log("msg", "pruned stale entries from offset catalogue", "pruned", pruned, "remaining", len(c.data))
 	}
-
-	return nil
 }
 
 // Save persists the catalogue to disk atomically. No-op if nothing changed.
@@ -161,15 +168,15 @@ func (c *offsetCatalogue) Set(key string, wm offsetWatermark) {
 	c.dirty = true
 }
 
-// offsetCompactor wraps a tsdb.Compactor to record the Kafka offset watermark
+// tsdbCompactor wraps a tsdb.Compactor to record the Kafka offset watermark
 // for each newly compacted block in the offset catalogue.
 //
 // It maintains two offset snapshots for rotation: on each compaction tick the
 // caller invokes Rotate with the current committed offset. The previous tick's
 // snapshot becomes the watermark stamped on new blocks, and the fresh value is
 // stored for the next tick. This bounds watermark lag to one compaction interval.
-type offsetCompactor struct {
-	inner     tsdb.Compactor
+type tsdbCompactor struct {
+	compactor tsdb.Compactor
 	catalogue *offsetCatalogue
 
 	topic     string
@@ -184,11 +191,11 @@ type offsetCompactor struct {
 	preCompactionOffset int64
 }
 
-var _ tsdb.Compactor = (*offsetCompactor)(nil)
+var _ tsdb.Compactor = (*tsdbCompactor)(nil)
 
-func newOffsetCompactor(inner tsdb.Compactor, catalogue *offsetCatalogue, topic string, partition int32, initialOffset int64) *offsetCompactor {
-	return &offsetCompactor{
-		inner:               inner,
+func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue, topic string, partition int32, initialOffset int64) *tsdbCompactor {
+	return &tsdbCompactor{
+		compactor:           compactor,
 		catalogue:           catalogue,
 		topic:               topic,
 		partition:           partition,
@@ -200,7 +207,7 @@ func newOffsetCompactor(inner tsdb.Compactor, catalogue *offsetCatalogue, topic 
 // Rotate advances the offset rotation. Call before each compaction tick.
 // If currentCommittedOffset is negative (no commit yet), the rotation is
 // skipped and the existing watermark is preserved.
-func (c *offsetCompactor) Rotate(currentCommittedOffset int64) {
+func (c *tsdbCompactor) Rotate(currentCommittedOffset int64) {
 	if currentCommittedOffset < 0 {
 		return
 	}
@@ -209,7 +216,7 @@ func (c *offsetCompactor) Rotate(currentCommittedOffset int64) {
 }
 
 // Watermark returns the offset watermark that will be stamped on new blocks.
-func (c *offsetCompactor) Watermark() offsetWatermark {
+func (c *tsdbCompactor) Watermark() offsetWatermark {
 	return offsetWatermark{
 		Topic:     c.topic,
 		Partition: c.partition,
@@ -217,12 +224,12 @@ func (c *offsetCompactor) Watermark() offsetWatermark {
 	}
 }
 
-func (c *offsetCompactor) Plan(dir string) ([]string, error) {
-	return c.inner.Plan(dir)
+func (c *tsdbCompactor) Plan(dir string) ([]string, error) {
+	return c.compactor.Plan(dir)
 }
 
-func (c *offsetCompactor) Write(dest string, b tsdb.BlockReader, mint, maxt int64, base *tsdb.BlockMeta) ([]ulid.ULID, error) {
-	ulids, err := c.inner.Write(dest, b, mint, maxt, base)
+func (c *tsdbCompactor) Write(dest string, b tsdb.BlockReader, mint, maxt int64, base *tsdb.BlockMeta) ([]ulid.ULID, error) {
+	ulids, err := c.compactor.Write(dest, b, mint, maxt, base)
 	if err != nil {
 		return ulids, err
 	}
@@ -230,8 +237,8 @@ func (c *offsetCompactor) Write(dest string, b tsdb.BlockReader, mint, maxt int6
 	return ulids, nil
 }
 
-func (c *offsetCompactor) Compact(dest string, dirs []string, open []*tsdb.Block) ([]ulid.ULID, error) {
-	ulids, err := c.inner.Compact(dest, dirs, open)
+func (c *tsdbCompactor) Compact(dest string, dirs []string, open []*tsdb.Block) ([]ulid.ULID, error) {
+	ulids, err := c.compactor.Compact(dest, dirs, open)
 	if err != nil {
 		return ulids, err
 	}
@@ -239,8 +246,8 @@ func (c *offsetCompactor) Compact(dest string, dirs []string, open []*tsdb.Block
 	return ulids, nil
 }
 
-func (c *offsetCompactor) CompactOOO(dest string, oooHead *tsdb.OOOCompactionHead) ([]ulid.ULID, error) {
-	ulids, err := c.inner.CompactOOO(dest, oooHead)
+func (c *tsdbCompactor) CompactOOO(dest string, oooHead *tsdb.OOOCompactionHead) ([]ulid.ULID, error) {
+	ulids, err := c.compactor.CompactOOO(dest, oooHead)
 	if err != nil {
 		return ulids, err
 	}
@@ -248,7 +255,7 @@ func (c *offsetCompactor) CompactOOO(dest string, oooHead *tsdb.OOOCompactionHea
 	return ulids, nil
 }
 
-func (c *offsetCompactor) recordBlocks(ulids []ulid.ULID) {
+func (c *tsdbCompactor) recordBlocks(ulids []ulid.ULID) {
 	if len(ulids) == 0 {
 		return
 	}

@@ -25,12 +25,11 @@ func TestOffsetCatalogue_SaveAndLoad(t *testing.T) {
 	c1.Set(block2.String(), offsetWatermark{Topic: "ingest", Partition: 3, Offset: 450})
 	require.NoError(t, c1.Save())
 
-	// Verify file is at the expected path.
 	_, err := os.Stat(filepath.Join(dir, offsetCatalogueFilename))
 	require.NoError(t, err)
 
 	c2 := newOffsetCatalogue(log.NewNopLogger(), dir, "tenant-1")
-	require.NoError(t, c2.Load([]ulid.ULID{block1, block2}))
+	require.NoError(t, c2.Load())
 
 	got, ok := c2.Get(offsetCatalogueBlockHead)
 	require.True(t, ok)
@@ -45,34 +44,32 @@ func TestOffsetCatalogue_SaveAndLoad(t *testing.T) {
 	assert.Equal(t, int64(450), got.Offset)
 }
 
-func TestOffsetCatalogue_LoadPrunes(t *testing.T) {
+func TestOffsetCatalogue_Prune(t *testing.T) {
 	dir := t.TempDir()
 	block1 := ulid.MustNew(1, nil)
 	stale := ulid.MustNew(2, nil)
 
-	c1 := newOffsetCatalogue(log.NewNopLogger(), dir, "tenant-1")
-	c1.Set(offsetCatalogueBlockHead, offsetWatermark{Offset: 500})
-	c1.Set(block1.String(), offsetWatermark{Offset: 400})
-	c1.Set(stale.String(), offsetWatermark{Offset: 450})
-	require.NoError(t, c1.Save())
+	c := newOffsetCatalogue(log.NewNopLogger(), dir, "tenant-1")
+	c.Set(offsetCatalogueBlockHead, offsetWatermark{Offset: 500})
+	c.Set(block1.String(), offsetWatermark{Offset: 400})
+	c.Set(stale.String(), offsetWatermark{Offset: 450})
 
-	c2 := newOffsetCatalogue(log.NewNopLogger(), dir, "tenant-1")
-	require.NoError(t, c2.Load([]ulid.ULID{block1}))
+	c.Prune([]ulid.ULID{block1})
 
-	_, ok := c2.Get(offsetCatalogueBlockHead)
+	_, ok := c.Get(offsetCatalogueBlockHead)
 	assert.True(t, ok)
 
-	_, ok = c2.Get(block1.String())
+	_, ok = c.Get(block1.String())
 	assert.True(t, ok)
 
-	_, ok = c2.Get(stale.String())
+	_, ok = c.Get(stale.String())
 	assert.False(t, ok)
 }
 
 func TestOffsetCatalogue_LoadToleratesMissingAndCorruptFiles(t *testing.T) {
 	t.Run("missing file", func(t *testing.T) {
 		c := newOffsetCatalogue(log.NewNopLogger(), t.TempDir(), "tenant-1")
-		require.NoError(t, c.Load(nil))
+		require.NoError(t, c.Load())
 		_, ok := c.Get(offsetCatalogueBlockHead)
 		assert.False(t, ok)
 	})
@@ -82,7 +79,7 @@ func TestOffsetCatalogue_LoadToleratesMissingAndCorruptFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, offsetCatalogueFilename), []byte("not json"), 0644))
 
 		c := newOffsetCatalogue(log.NewNopLogger(), dir, "tenant-1")
-		require.NoError(t, c.Load(nil))
+		require.NoError(t, c.Load())
 		_, ok := c.Get(offsetCatalogueBlockHead)
 		assert.False(t, ok)
 	})
@@ -92,13 +89,13 @@ func TestOffsetCatalogue_LoadToleratesMissingAndCorruptFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, offsetCatalogueFilename), []byte(`{"version":99,"data":{}}`), 0644))
 
 		c := newOffsetCatalogue(log.NewNopLogger(), dir, "tenant-1")
-		require.NoError(t, c.Load(nil))
+		require.NoError(t, c.Load())
 		_, ok := c.Get(offsetCatalogueBlockHead)
 		assert.False(t, ok)
 	})
 }
 
-// mockCompactor implements tsdb.Compactor for testing offsetCompactor.
+// mockCompactor implements tsdb.Compactor for testing tsdbCompactor.
 type mockCompactor struct {
 	planResult    []string
 	writeResult   []ulid.ULID
@@ -130,10 +127,10 @@ func (m *mockCompactor) CompactOOO(string, *tsdb.OOOCompactionHead) ([]ulid.ULID
 	return m.oooResult, m.err
 }
 
-func newTestOffsetCompactor(t *testing.T, inner *mockCompactor, initialOffset int64) (*offsetCompactor, *offsetCatalogue) {
+func newTestOffsetCompactor(t *testing.T, inner *mockCompactor, initialOffset int64) (*tsdbCompactor, *offsetCatalogue) {
 	t.Helper()
 	cat := newOffsetCatalogue(log.NewNopLogger(), t.TempDir(), "tenant-1")
-	c := newOffsetCompactor(inner, cat, "ingest", 0, initialOffset)
+	c := newTSDBCompactor(inner, cat, "ingest", 0, initialOffset)
 	return c, cat
 }
 
