@@ -3,19 +3,13 @@
 package ingester
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 
 	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/tsdb"
-
-	"github.com/grafana/mimir/pkg/util/atomicfs"
 )
 
 const (
@@ -26,9 +20,12 @@ const (
 )
 
 type offsetWatermark struct {
-	Topic     string `json:"topic"`
-	Partition int32  `json:"partition"`
-	Offset    int64  `json:"offset"`
+	Partition int32 `json:"partition"`
+	Offset    int64 `json:"offset"`
+}
+
+func (o offsetWatermark) String() string {
+	return fmt.Sprintf("%d/%d", o.Partition, o.Offset)
 }
 
 type offsetCatalogueData struct {
@@ -63,104 +60,40 @@ func (c *offsetCatalogue) filePath() string {
 	return filepath.Join(c.dir, offsetCatalogueFilename)
 }
 
-// Load reads the catalogue from disk. If the file does not exist or is corrupt
-// the catalogue starts empty.
 func (c *offsetCatalogue) Load() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	data, err := os.ReadFile(c.filePath())
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read offset catalogue: %w", err)
-	}
-
-	var stored offsetCatalogueData
-	if err := json.Unmarshal(data, &stored); err != nil {
-		level.Warn(c.logger).Log("msg", "discarding corrupt offset catalogue", "path", c.filePath(), "err", err)
-		return nil
-	}
-	if stored.Version != offsetCatalogueVersion {
-		level.Warn(c.logger).Log("msg", "discarding offset catalogue with unknown version", "path", c.filePath(), "version", stored.Version)
-		return nil
-	}
-	if stored.Data == nil {
-		return nil
-	}
-
-	for key, wm := range stored.Data {
-		c.data[key] = wm
-	}
+	// TODO: not implemented
 	return nil
 }
 
-// Prune removes entries for blocks not in existingBlocks. The __head__ entry is
-// always kept.
-func (c *offsetCatalogue) Prune(existingBlocks []ulid.ULID) {
+//func (c *offsetCatalogue) Prune(existingBlocks []ulid.ULID) {
+//	// Prune removes entries for blocks not in existingBlocks. The __head__ entry is always kept.
+//	panic("not implemented")
+//
+//}
+//
+//func (c *offsetCatalogue) Save() error {
+//	// Save persists the catalogue to disk atomically. No-op if nothing changed.
+//	panic("not implemented")
+//}
+
+func (c *offsetCatalogue) GetHead() (offsetWatermark, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	existing := make(map[string]struct{}, len(existingBlocks))
-	for _, id := range existingBlocks {
-		existing[id.String()] = struct{}{}
-	}
-
-	pruned := 0
-	for key := range c.data {
-		if key == offsetCatalogueBlockHead {
-			continue
-		}
-		if _, ok := existing[key]; !ok {
-			delete(c.data, key)
-			pruned++
-		}
-	}
-
-	if pruned > 0 {
-		c.dirty = true
-		level.Info(c.logger).Log("msg", "pruned stale entries from offset catalogue", "pruned", pruned, "remaining", len(c.data))
-	}
-}
-
-// Save persists the catalogue to disk atomically. No-op if nothing changed.
-func (c *offsetCatalogue) Save() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if !c.dirty {
-		return nil
-	}
-
-	stored := offsetCatalogueData{
-		Version: offsetCatalogueVersion,
-		Data:    c.data,
-	}
-	data, err := json.Marshal(stored)
-	if err != nil {
-		return err
-	}
-
-	if err := atomicfs.CreateFile(c.filePath(), bytes.NewReader(data)); err != nil {
-		return fmt.Errorf("write offset catalogue: %w", err)
-	}
-
-	c.dirty = false
-	return nil
-}
-
-// Get returns the watermark for the given key and whether it exists.
-func (c *offsetCatalogue) Get(key string) (offsetWatermark, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	wm, ok := c.data[key]
+	wm, ok := c.data[offsetCatalogueBlockHead]
 	return wm, ok
 }
 
-// Set stores or updates the watermark for the given key.
+func (c *offsetCatalogue) SetHead(wm offsetWatermark) {
+	c.set(offsetCatalogueBlockHead, wm)
+}
+
 func (c *offsetCatalogue) Set(key string, wm offsetWatermark) {
+	c.set(key, wm)
+}
+
+// Set stores or updates the watermark for the given key.
+func (c *offsetCatalogue) set(key string, wm offsetWatermark) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -168,60 +101,32 @@ func (c *offsetCatalogue) Set(key string, wm offsetWatermark) {
 	c.dirty = true
 }
 
-// tsdbCompactor wraps a tsdb.Compactor to record the Kafka offset watermark
-// for each newly compacted block in the offset catalogue.
+// tsdbCompactor wraps a tsdb.Compactor to record the Kafka offset watermark for each newly compacted block
+// in the offset catalogue.
 //
-// It maintains two offset snapshots for rotation: on each compaction tick the
-// caller invokes Rotate with the current committed offset. The previous tick's
-// snapshot becomes the watermark stamped on new blocks, and the fresh value is
-// stored for the next tick. This bounds watermark lag to one compaction interval.
+// Before each compaction tick the caller sets the watermark via SetOffset. New blocks produced during compaction
+// are stamped with that watermark.
 type tsdbCompactor struct {
 	compactor tsdb.Compactor
 	catalogue *offsetCatalogue
 
-	topic     string
 	partition int32
-
-	// compactionOffset is the watermark assigned to blocks produced in the
-	// current tick. Set from the previous tick's preCompactionOffset.
-	compactionOffset int64
-
-	// preCompactionOffset is the committed offset snapshot taken at the start
-	// of the current tick. Becomes compactionOffset at the next Rotate.
-	preCompactionOffset int64
+	offset    int64
 }
 
 var _ tsdb.Compactor = (*tsdbCompactor)(nil)
 
-func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue, topic string, partition int32, initialOffset int64) *tsdbCompactor {
+func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue, partition int32) *tsdbCompactor {
 	return &tsdbCompactor{
-		compactor:           compactor,
-		catalogue:           catalogue,
-		topic:               topic,
-		partition:           partition,
-		compactionOffset:    initialOffset,
-		preCompactionOffset: initialOffset,
+		compactor: compactor,
+		catalogue: catalogue,
+		partition: partition,
 	}
 }
 
-// Rotate advances the offset rotation. Call before each compaction tick.
-// If currentCommittedOffset is negative (no commit yet), the rotation is
-// skipped and the existing watermark is preserved.
-func (c *tsdbCompactor) Rotate(currentCommittedOffset int64) {
-	if currentCommittedOffset < 0 {
-		return
-	}
-	c.compactionOffset = c.preCompactionOffset
-	c.preCompactionOffset = currentCommittedOffset
-}
-
-// Watermark returns the offset watermark that will be stamped on new blocks.
-func (c *tsdbCompactor) Watermark() offsetWatermark {
-	return offsetWatermark{
-		Topic:     c.topic,
-		Partition: c.partition,
-		Offset:    c.compactionOffset,
-	}
+// SetOffset sets the offset watermark that will be stamped on new blocks.
+func (c *tsdbCompactor) SetOffset(offset int64) {
+	c.offset = offset
 }
 
 func (c *tsdbCompactor) Plan(dir string) ([]string, error) {
@@ -233,7 +138,7 @@ func (c *tsdbCompactor) Write(dest string, b tsdb.BlockReader, mint, maxt int64,
 	if err != nil {
 		return ulids, err
 	}
-	c.recordBlocks(ulids)
+	c.updateCatalogue(ulids)
 	return ulids, nil
 }
 
@@ -242,7 +147,7 @@ func (c *tsdbCompactor) Compact(dest string, dirs []string, open []*tsdb.Block) 
 	if err != nil {
 		return ulids, err
 	}
-	c.recordBlocks(ulids)
+	c.updateCatalogue(ulids)
 	return ulids, nil
 }
 
@@ -251,15 +156,18 @@ func (c *tsdbCompactor) CompactOOO(dest string, oooHead *tsdb.OOOCompactionHead)
 	if err != nil {
 		return ulids, err
 	}
-	c.recordBlocks(ulids)
+	c.updateCatalogue(ulids)
 	return ulids, nil
 }
 
-func (c *tsdbCompactor) recordBlocks(ulids []ulid.ULID) {
+func (c *tsdbCompactor) updateCatalogue(ulids []ulid.ULID) {
 	if len(ulids) == 0 {
 		return
 	}
-	wm := c.Watermark()
+	wm := offsetWatermark{
+		Partition: c.partition,
+		Offset:    c.offset,
+	}
 	for _, id := range ulids {
 		c.catalogue.Set(id.String(), wm)
 	}
