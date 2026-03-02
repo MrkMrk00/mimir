@@ -181,6 +181,7 @@ func requestOAuthToken(ctx context.Context, socketPath string, timeout time.Dura
 
 	client := &http.Client{
 		Transport: &http.Transport{
+			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 			},
