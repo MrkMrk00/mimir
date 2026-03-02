@@ -516,9 +516,9 @@ func (s *seriesStripe) reloadConfig(asm *asmodel.Matchers, cat *costattribution.
 			if err := idx.Series(ref, &buf, nil); err != nil {
 				s.activeSeriesAttributionFailureCounter.Add(1)
 				// This shouldn't really happen because we shouldn't store refs that aren't in the head anymore.
-				// But if it happens, we don't want to panic, so let's just reset and assume this is an empty labelset.
+				// But if it happens, we don't want to panic, so we skip the cost attribution and matchers update.
 				// If someone needs to debug this, they should check the counter incremented above.
-				buf.Reset()
+				continue
 			}
 			lbls := buf.Labels()
 			if catChanged {
