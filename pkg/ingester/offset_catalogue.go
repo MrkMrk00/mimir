@@ -42,9 +42,8 @@ type offsetCatalogue struct {
 	dir    string
 	userID string
 
-	mu    sync.Mutex
-	data  map[string]offsetWatermark
-	dirty bool
+	mu   sync.Mutex
+	data map[string]offsetWatermark
 }
 
 func newOffsetCatalogue(logger log.Logger, dir, userID string) *offsetCatalogue {
@@ -99,10 +98,9 @@ func (c *offsetCatalogue) set(key string, wm offsetWatermark) {
 	defer c.mu.Unlock()
 
 	c.data[key] = wm
-	c.dirty = true
 }
 
-func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue, partition int32, headBlockOffset int64) tsdb.NewCompactorFunc {
+func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue, partition int32, offsetReader offsetReader) tsdb.NewCompactorFunc {
 	return func(ctx context.Context, r prometheus.Registerer, l *slog.Logger, ranges []int64, pool chunkenc.Pool, opts *tsdb.Options) (tsdb.Compactor, error) {
 		compactor, err := tsdb.NewLeveledCompactorWithOptions(ctx, r, l, ranges, pool, tsdb.LeveledCompactorOptions{
 			MaxBlockChunkSegmentSize:    opts.MaxBlockChunkSegmentSize,
@@ -115,15 +113,15 @@ func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue, partition in
 			return nil, err
 		}
 
-		tsdbCompactor := newTSDBCompactor(compactor, catalogue, partition)
+		tsdbCompactor := newTSDBCompactor(compactor, catalogue, partition, offsetReader)
 		db.tsdbCompactor = tsdbCompactor
-
-		// Seeds the tsdbCompactor with previous head block offset, if available. This is so blocks created during post-WAL replay head compaction
-		// were attributed to the offset, that points at where the head was before the DB was closed -- not what's commited now.
-		tsdbCompactor.SetOffset(headBlockOffset)
 
 		return tsdbCompactor, nil
 	}
+}
+
+type offsetReader interface {
+	LastSeenOffset() int64
 }
 
 // tsdbCompactor wraps a tsdb.Compactor to record the Kafka offset watermark for each newly compacted block
@@ -133,22 +131,19 @@ type tsdbCompactor struct {
 	catalogue *offsetCatalogue
 
 	partition int32
-	offset    int64
+
+	offsetReader offsetReader
 }
 
 var _ tsdb.Compactor = (*tsdbCompactor)(nil)
 
-func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue, partition int32) *tsdbCompactor {
+func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue, partition int32, offsetReader offsetReader) *tsdbCompactor {
 	return &tsdbCompactor{
-		compactor: compactor,
-		catalogue: catalogue,
-		partition: partition,
+		compactor:    compactor,
+		catalogue:    catalogue,
+		partition:    partition,
+		offsetReader: offsetReader,
 	}
-}
-
-// SetOffset sets the offset watermark that will be stamped on new blocks.
-func (c *tsdbCompactor) SetOffset(offset int64) {
-	c.offset = offset
 }
 
 func (c *tsdbCompactor) Plan(dir string) ([]string, error) {
@@ -156,41 +151,34 @@ func (c *tsdbCompactor) Plan(dir string) ([]string, error) {
 }
 
 func (c *tsdbCompactor) Write(dest string, b tsdb.BlockReader, mint, maxt int64, base *tsdb.BlockMeta) ([]ulid.ULID, error) {
-	ulids, err := c.compactor.Write(dest, b, mint, maxt, base)
-	if err != nil {
-		return ulids, err
-	}
-	c.updateCatalogue(ulids)
-	return ulids, nil
+	return c.compactAndUpdateCatalogue(func() ([]ulid.ULID, error) {
+		return c.compactor.Write(dest, b, mint, maxt, base)
+	})
 }
 
 func (c *tsdbCompactor) Compact(dest string, dirs []string, open []*tsdb.Block) ([]ulid.ULID, error) {
-	ulids, err := c.compactor.Compact(dest, dirs, open)
-	if err != nil {
-		return ulids, err
-	}
-	c.updateCatalogue(ulids)
-	return ulids, nil
+	return c.compactAndUpdateCatalogue(func() ([]ulid.ULID, error) {
+		return c.compactor.Compact(dest, dirs, open)
+	})
 }
 
 func (c *tsdbCompactor) CompactOOO(dest string, oooHead *tsdb.OOOCompactionHead) ([]ulid.ULID, error) {
-	ulids, err := c.compactor.CompactOOO(dest, oooHead)
-	if err != nil {
-		return ulids, err
-	}
-	c.updateCatalogue(ulids)
-	return ulids, nil
+	return c.compactAndUpdateCatalogue(func() ([]ulid.ULID, error) {
+		return c.compactor.CompactOOO(dest, oooHead)
+	})
 }
 
-func (c *tsdbCompactor) updateCatalogue(ulids []ulid.ULID) {
-	if len(ulids) == 0 {
-		return
-	}
+func (c *tsdbCompactor) compactAndUpdateCatalogue(compactFunc func() ([]ulid.ULID, error)) ([]ulid.ULID, error) {
 	wm := offsetWatermark{
 		Partition: c.partition,
-		Offset:    c.offset,
+		Offset:    c.offsetReader.LastSeenOffset(),
+	}
+	ulids, err := compactFunc()
+	if err != nil {
+		return ulids, err
 	}
 	for _, id := range ulids {
 		c.catalogue.Set(id.String(), wm)
 	}
+	return ulids, nil
 }

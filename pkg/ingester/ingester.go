@@ -2757,7 +2757,7 @@ func (i *Ingester) createTSDB(userID string, walReplayConcurrency int) (*userTSD
 
 		userDB.offsetCatalogue = catalogue
 
-		newCompactorFunc = tsdbCompactorFactory(userDB, catalogue, i.ingestPartitionID, i.ingestReader.LastSeenOffset())
+		newCompactorFunc = tsdbCompactorFactory(userDB, catalogue, i.ingestPartitionID, i.ingestReader)
 	}
 
 	oooTW := i.limits.OutOfOrderTimeWindow(userID)
@@ -3257,8 +3257,6 @@ func (i *Ingester) compactionServiceRunning(ctx context.Context) error {
 			// clearing the read-only mode. See [Ingester.PrepareInstanceRingDownscaleHandler]
 			i.numCompactionsInProgress.Inc()
 
-			i.setCompactionWatermark()
-
 			// The forcedCompactionMaxTime has no meaning because force=false.
 			i.compactBlocks(ctx, false, 0, nil)
 
@@ -3287,8 +3285,6 @@ func (i *Ingester) compactionServiceRunning(ctx context.Context) error {
 			// This is because we want to track the number of compactions accurately before the
 			// downscale handler is called. This ensures that the ingester will never leave the
 			// read-only state. (See [Ingester.FlushHandler])
-
-			i.setCompactionWatermark()
 
 			// Always pass math.MaxInt64 as forcedCompactionMaxTime because we want to compact the whole TSDB head.
 			i.compactBlocks(ctx, true, math.MaxInt64, req.users)
@@ -3388,22 +3384,6 @@ func (i *Ingester) timeToNextZoneAwareCompaction(now time.Time, zones []string) 
 		"next_compaction_in", result)
 
 	return result
-}
-
-// setCompactionWatermark snapshots the current committed offset and sets it as the watermark on every tenant's
-// tsdbCompactor. Blocks compacted in this tick will be stamped with this offset.
-func (i *Ingester) setCompactionWatermark() {
-	if i.ingestReader == nil {
-		return
-	}
-	offset := i.ingestReader.LastSeenOffset()
-	for _, userID := range i.getTSDBUsers() {
-		userDB := i.getTSDB(userID)
-		if userDB == nil {
-			continue
-		}
-		userDB.tsdbCompactor.SetOffset(offset)
-	}
 }
 
 // Compacts all compactable blocks. Force flag will force compaction even if head is not compactable yet.
