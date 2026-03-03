@@ -10,6 +10,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/prometheus/tsdb"
+	"go.uber.org/atomic"
 )
 
 const (
@@ -111,7 +112,7 @@ type tsdbCompactor struct {
 	catalogue *offsetCatalogue
 
 	partition int32
-	offset    int64
+	offset    atomic.Int64
 }
 
 var _ tsdb.Compactor = (*tsdbCompactor)(nil)
@@ -126,7 +127,7 @@ func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue, part
 
 // SetOffset sets the offset watermark that will be stamped on new blocks.
 func (c *tsdbCompactor) SetOffset(offset int64) {
-	c.offset = offset
+	c.offset.Store(offset)
 }
 
 func (c *tsdbCompactor) Plan(dir string) ([]string, error) {
@@ -166,7 +167,7 @@ func (c *tsdbCompactor) updateCatalogue(ulids []ulid.ULID) {
 	}
 	wm := offsetWatermark{
 		Partition: c.partition,
-		Offset:    c.offset,
+		Offset:    c.offset.Load(),
 	}
 	for _, id := range ulids {
 		c.catalogue.Set(id.String(), wm)

@@ -3286,7 +3286,7 @@ func (i *Ingester) compactionServiceRunning(ctx context.Context) error {
 			// clearing the read-only mode. See [Ingester.PrepareInstanceRingDownscaleHandler]
 			i.numCompactionsInProgress.Inc()
 
-			i.setCompactionWatermark()
+			//i.setCompactionWatermark()
 
 			// The forcedCompactionMaxTime has no meaning because force=false.
 			i.compactBlocks(ctx, false, 0, nil)
@@ -4607,20 +4607,23 @@ func timeUntilCompaction(now time.Time, compactionInterval, zoneOffset time.Dura
 func (i *Ingester) NotifyPreCommit(ctx context.Context) error {
 	level.Debug(i.logger).Log("msg", "fsyncing TSDBs", "concurrency", i.cfg.IngestStorageConfig.WriteLogsFsyncBeforeKafkaCommitConcurrency)
 
-	// Holds the current stable offset, that is safe to mark all block heads with in user's offset catalogue (see below).
-	var watermark offsetWatermark
-	if i.ingestReader != nil {
-		watermark = offsetWatermark{
-			Partition: i.ingestPartitionID,
-			Offset:    i.ingestReader.LastCommittedOffset(),
-		}
-	}
+	//// Holds the current stable offset, that is safe to mark all block heads with in user's offset catalogue (see below).
+	//var watermark offsetWatermark
+	//if i.ingestReader != nil {
+	//	watermark = offsetWatermark{
+	//		Partition: i.ingestPartitionID,
+	//		Offset:    i.ingestReader.LastCommittedOffset(),
+	//	}
+	//}
+	//
+	//maybeUpdateCatalogueHead := func(db *userTSDB) {
+	//	if db.offsetCatalogue != nil {
+	//		db.offsetCatalogue.SetHead(watermark)
+	//	}
+	//}
 
-	maybeUpdateCatalogueHead := func(db *userTSDB) {
-		if db.offsetCatalogue != nil {
-			db.offsetCatalogue.SetHead(watermark)
-		}
-	}
+	// Holds the current stable offset, that is safe to mark all block heads with in user's offset catalogue (see below).
+	offset := i.ingestReader.LastCommittedOffset()
 
 	return concurrency.ForEachUser(ctx, i.getTSDBUsers(), i.cfg.IngestStorageConfig.WriteLogsFsyncBeforeKafkaCommitConcurrency, func(ctx context.Context, userID string) error {
 		db := i.getTSDB(userID)
@@ -4629,7 +4632,9 @@ func (i *Ingester) NotifyPreCommit(ctx context.Context) error {
 		}
 
 		// This is noop if the db wasn't bound to an offset catalogue.
-		maybeUpdateCatalogueHead(db)
+		//maybeUpdateCatalogueHead(db)
+
+		db.tsdbCompactor.SetOffset(offset)
 
 		if err := db.Head().FsyncWLSegments(); err != nil {
 			return err
