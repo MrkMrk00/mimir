@@ -4,23 +4,27 @@ package ingester
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/runutil"
 	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+
+	"github.com/grafana/mimir/pkg/util/atomicfs"
+	"github.com/grafana/mimir/pkg/util/spanlogger"
 )
 
 const (
 	offsetCatalogueVersion = 1
-
-	// Special key that holds the watermark of the head block.
-	offsetCatalogueBlockHead = "__head__"
 )
 
 type offsetWatermark struct {
@@ -32,10 +36,10 @@ func (o offsetWatermark) String() string {
 	return fmt.Sprintf("%d/%d", o.Partition, o.Offset)
 }
 
-//type offsetCatalogueData struct {
-//	Version int                        `json:"version"`
-//	Data    map[string]offsetWatermark `json:"data"`
-//}
+type offsetCatalogueData struct {
+	Version int                        `json:"version"`
+	Data    map[string]offsetWatermark `json:"data"`
+}
 
 type offsetCatalogue struct {
 	logger log.Logger
@@ -46,7 +50,8 @@ type offsetCatalogue struct {
 
 	offsetReader offsetReader
 
-	data sync.Map // ulid -> offset watermark
+	mu   sync.Mutex
+	data map[string]offsetWatermark
 }
 
 func newOffsetCatalogue(logger log.Logger, dir, userID string, partition int32, offsetReader offsetReader) *offsetCatalogue {
@@ -62,44 +67,106 @@ func newOffsetCatalogue(logger log.Logger, dir, userID string, partition int32, 
 
 const offsetCatalogueFilename = "offset-catalogue.json"
 
-func (c *offsetCatalogue) filePath() string {
-	return filepath.Join(c.dir, offsetCatalogueFilename)
-}
+func (c *offsetCatalogue) Sync(ctx context.Context) error {
+	spanLogger, ctx := spanlogger.New(ctx, c.logger, tracer, "Ingester.OffsetCatalogue.Sync")
+	defer spanLogger.Finish()
 
-func (c *offsetCatalogue) Load() error {
-	// TODO: not implemented
+	lastSeenOffset := c.offsetReader.LastSeenOffset()
+
+	oldData, err := readOffsetCatalogueFromFile(c.dir)
+	if err != nil {
+		return fmt.Errorf("read offset catalogue: %w", err)
+	}
+
+	blocks := make(map[string]struct{})
+	for id, err := range listBlocks(c.dir) {
+		if err != nil {
+			return err
+		}
+		blocks[id.String()] = struct{}{}
+	}
+
+	c.mu.Lock()
+	catalogueData := c.data
+	clear(c.data)
+	c.mu.Unlock()
+
+	data := offsetCatalogueData{
+		Version: offsetCatalogueVersion,
+		Data:    make(map[string]offsetWatermark, len(blocks)),
+	}
+	for id := range blocks {
+		if wmk, ok := oldData.Data[id]; ok {
+			// If block already exists in the previous catalogue, keep it.
+			data.Data[id] = wmk
+			continue
+		}
+		wmk, ok := catalogueData[id]
+		if !ok || wmk.Offset < 0 {
+			// If block wasn't found in the catalogue (e.g. block existed before start),
+			// or block's watermark offset wasn't captured, fallback to the most recent lastSeenOffset.
+			// This is conservative: if block was found on disk, its data came from offset lower than current lastSeenOffset.
+			wmk = offsetWatermark{
+				Partition: c.partition,
+				Offset:    lastSeenOffset,
+			}
+		} else if wmk.Offset > lastSeenOffset {
+			level.Warn(spanLogger).Log("msg", "found unexpected offset watermark", "user", c.userID, "block", id, "partition", wmk.Partition, "offset", wmk.Offset, "last_seen_offset", lastSeenOffset)
+			continue
+		}
+		data.Data[id] = wmk
+	}
+
+	if err := writeOffsetCatalogueToFile(c.logger, c.dir, data); err != nil {
+		level.Warn(spanLogger).Log("msg", "writing offset catalogue failed", "user", c.userID, "err", err)
+	}
+
 	return nil
 }
 
-//func (c *offsetCatalogue) Prune(existingBlocks []ulid.ULID) {
-//	// Prune removes entries for blocks not in existingBlocks. The __head__ entry is always kept.
-//	panic("not implemented")
-//
-//}
-//
-//func (c *offsetCatalogue) Save() error {
-//	// Save persists the catalogue to disk atomically. No-op if nothing changed.
-//	panic("not implemented")
-//}
+func readOffsetCatalogueFromFile(dir string) (offsetCatalogueData, error) {
+	filePath := filepath.Join(dir, offsetCatalogueFilename)
+	b, err := os.ReadFile(filePath)
+	if err != nil {
+		return offsetCatalogueData{}, fmt.Errorf("read %s: %w", filePath, err)
+	}
 
-//func (c *offsetCatalogue) GetHead() (offsetWatermark, bool) {
-//	c.mu.Lock()
-//	defer c.mu.Unlock()
-//
-//	wm, ok := c.data[offsetCatalogueBlockHead]
-//	return wm, ok
-//}
-//
-//func (c *offsetCatalogue) SetHead(wm offsetWatermark) {
-//	c.set(offsetCatalogueBlockHead, wm)
-//}
+	var data offsetCatalogueData
+	if err := json.Unmarshal(b, &data); err != nil {
+		return offsetCatalogueData{}, fmt.Errorf("parse json %s: %w", filePath, err)
+	}
+	if data.Version != offsetCatalogueVersion {
+		return offsetCatalogueData{}, fmt.Errorf("expected version %d got %d", offsetCatalogueVersion, data.Version)
+	}
+	return data, nil
+}
+
+func writeOffsetCatalogueToFile(logger log.Logger, dir string, data offsetCatalogueData) (err error) {
+	filePath := filepath.Join(dir, offsetCatalogueFilename)
+
+	f, err := atomicfs.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", filePath, err)
+	}
+	defer runutil.CloseWithErrCapture(&err, f, "write offset catalogue to file %s", filePath)
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "\t")
+
+	if err := enc.Encode(data); err != nil {
+		return err
+	}
+	return nil
+}
 
 func (c *offsetCatalogue) SetOffset(key string, offset int64) {
-	wm := offsetWatermark{
+	wmk := offsetWatermark{
 		Partition: c.partition,
 		Offset:    offset,
 	}
-	c.data.Store(key, wm)
+	c.mu.Lock()
+	c.data[key] = wmk
+	c.mu.Unlock()
 }
 
 func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue) tsdb.NewCompactorFunc {

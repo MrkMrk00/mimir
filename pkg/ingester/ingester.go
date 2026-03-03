@@ -3293,6 +3293,9 @@ func (i *Ingester) compactionServiceRunning(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		}
+
+		// Sync user DB's offset catalogue in the end of this compaction cycle.
+		i.offsetCataloguesSync(ctx)
 	}
 	return nil
 }
@@ -3683,6 +3686,30 @@ func filterUsersToCompactToReduceInMemorySeries(numMemorySeries, earlyCompaction
 	}
 
 	return usersToCompact
+}
+
+func (i *Ingester) offsetCataloguesSync(ctx context.Context) {
+	if i.ingestReader == nil {
+		return
+	}
+
+	const syncConcurrency = 4 // TODO: config me
+	_ = concurrency.ForEachUser(ctx, i.getTSDBUsers(), syncConcurrency, func(ctx context.Context, userID string) error {
+		// Get the user's DB. If the user doesn't exist, we skip it.
+		db := i.getTSDB(userID)
+		if db == nil || db.offsetCatalogue == nil {
+			return nil
+		}
+
+		err := db.offsetCatalogue.Sync(ctx)
+		if err != nil {
+			level.Warn(i.logger).Log("msg", "offset catalogue sync failed", "user", userID, "err", err)
+		} else {
+			level.Debug(i.logger).Log("msg", "successfully sync offset catalogue", "user", userID)
+		}
+
+		return nil
+	})
 }
 
 func (i *Ingester) closeAndDeleteIdleUserTSDBs(ctx context.Context) error {
