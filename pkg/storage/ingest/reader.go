@@ -127,6 +127,9 @@ func newPartitionReader(kafkaCfg KafkaConfig, partitionID int32, instanceID stri
 		offsetFile: newOffsetFile(offsetFilePath, partitionID, log.With(logger, "partition", partitionID)),
 	}
 
+	// Initialize the last seen offset with -1 to signal no offset has been consumed yet (0 is a valid offset).
+	r.lastSeenOffset.Store(-1)
+
 	kpromMetrics := NewKafkaReaderClientMetrics(ReaderMetricsPrefix, "partition-reader", reg)
 	r.metrics = NewReaderMetrics(reg, r, kafkaCfg.Topic, kpromMetrics)
 	// Initialize the last consumed offset metric to -1 to signal no offset has been consumed yet (0 is a valid offset).

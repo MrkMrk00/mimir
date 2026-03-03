@@ -42,16 +42,21 @@ type offsetCatalogue struct {
 	dir    string
 	userID string
 
-	mu   sync.Mutex
-	data map[string]offsetWatermark
+	partition int32
+
+	offsetReader offsetReader
+
+	data sync.Map // ulid -> offset watermark
 }
 
-func newOffsetCatalogue(logger log.Logger, dir, userID string) *offsetCatalogue {
+func newOffsetCatalogue(logger log.Logger, dir, userID string, partition int32, offsetReader offsetReader) *offsetCatalogue {
 	return &offsetCatalogue{
 		logger: logger,
 		dir:    dir,
 		userID: userID,
-		data:   make(map[string]offsetWatermark),
+
+		partition:    partition,
+		offsetReader: offsetReader,
 	}
 }
 
@@ -89,18 +94,15 @@ func (c *offsetCatalogue) Load() error {
 //	c.set(offsetCatalogueBlockHead, wm)
 //}
 
-func (c *offsetCatalogue) Set(key string, wm offsetWatermark) {
-	c.set(key, wm)
+func (c *offsetCatalogue) SetOffset(key string, offset int64) {
+	wm := offsetWatermark{
+		Partition: c.partition,
+		Offset:    offset,
+	}
+	c.data.Store(key, wm)
 }
 
-func (c *offsetCatalogue) set(key string, wm offsetWatermark) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.data[key] = wm
-}
-
-func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue, partition int32, offsetReader offsetReader) tsdb.NewCompactorFunc {
+func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue) tsdb.NewCompactorFunc {
 	return func(ctx context.Context, r prometheus.Registerer, l *slog.Logger, ranges []int64, pool chunkenc.Pool, opts *tsdb.Options) (tsdb.Compactor, error) {
 		compactor, err := tsdb.NewLeveledCompactorWithOptions(ctx, r, l, ranges, pool, tsdb.LeveledCompactorOptions{
 			MaxBlockChunkSegmentSize:    opts.MaxBlockChunkSegmentSize,
@@ -113,7 +115,7 @@ func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue, partition in
 			return nil, err
 		}
 
-		tsdbCompactor := newTSDBCompactor(compactor, catalogue, partition, offsetReader)
+		tsdbCompactor := newTSDBCompactor(compactor, catalogue)
 		db.tsdbCompactor = tsdbCompactor
 
 		return tsdbCompactor, nil
@@ -129,20 +131,14 @@ type offsetReader interface {
 type tsdbCompactor struct {
 	compactor tsdb.Compactor
 	catalogue *offsetCatalogue
-
-	partition int32
-
-	offsetReader offsetReader
 }
 
 var _ tsdb.Compactor = (*tsdbCompactor)(nil)
 
-func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue, partition int32, offsetReader offsetReader) *tsdbCompactor {
+func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue) *tsdbCompactor {
 	return &tsdbCompactor{
-		compactor:    compactor,
-		catalogue:    catalogue,
-		partition:    partition,
-		offsetReader: offsetReader,
+		compactor: compactor,
+		catalogue: catalogue,
 	}
 }
 
@@ -169,16 +165,14 @@ func (c *tsdbCompactor) CompactOOO(dest string, oooHead *tsdb.OOOCompactionHead)
 }
 
 func (c *tsdbCompactor) compactAndUpdateCatalogue(compactFunc func() ([]ulid.ULID, error)) ([]ulid.ULID, error) {
-	wm := offsetWatermark{
-		Partition: c.partition,
-		Offset:    c.offsetReader.LastSeenOffset(),
-	}
+	// Record the last seen offset before running the compaction func. The "seen" records are already in the head by this time.
+	offset := c.catalogue.offsetReader.LastSeenOffset()
 	ulids, err := compactFunc()
 	if err != nil {
 		return ulids, err
 	}
 	for _, id := range ulids {
-		c.catalogue.Set(id.String(), wm)
+		c.catalogue.SetOffset(id.String(), offset)
 	}
 	return ulids, nil
 }

@@ -2753,11 +2753,11 @@ func (i *Ingester) createTSDB(userID string, walReplayConcurrency int) (*userTSD
 	// are tagged with the Kafka offset watermark.
 	var newCompactorFunc tsdb.NewCompactorFunc
 	if i.ingestReader != nil {
-		catalogue := newOffsetCatalogue(userLogger, udir, userID)
+		catalogue := newOffsetCatalogue(userLogger, udir, userID, i.ingestPartitionID, i.ingestReader)
 
 		userDB.offsetCatalogue = catalogue
 
-		newCompactorFunc = tsdbCompactorFactory(userDB, catalogue, i.ingestPartitionID, i.ingestReader)
+		newCompactorFunc = tsdbCompactorFactory(userDB, catalogue)
 	}
 
 	oooTW := i.limits.OutOfOrderTimeWindow(userID)
