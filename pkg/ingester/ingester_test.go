@@ -12352,3 +12352,61 @@ func makeTestRW2WriteRequest(syms *rw2util.SymbolTableBuilder) *mimirpb.WriteReq
 
 	return req
 }
+
+func Test_sliceEqualsSet(t *testing.T) {
+	tests := []struct {
+		name  string
+		slice []string
+		set   map[string]struct{}
+		want  bool
+	}{
+		{
+			name:  "both empty",
+			slice: nil,
+			set:   map[string]struct{}{},
+			want:  true,
+		},
+		{
+			name:  "equal no duplicates",
+			slice: []string{"a", "b"},
+			set:   map[string]struct{}{"a": {}, "b": {}},
+			want:  true,
+		},
+		{
+			name:  "slice has extra element",
+			slice: []string{"a", "b", "c"},
+			set:   map[string]struct{}{"a": {}, "b": {}},
+			want:  false,
+		},
+		{
+			name:  "set has extra element",
+			slice: []string{"a"},
+			set:   map[string]struct{}{"a": {}, "b": {}},
+			want:  false,
+		},
+		{
+			name:  "slice element not in set",
+			slice: []string{"a", "c"},
+			set:   map[string]struct{}{"a": {}, "b": {}},
+			want:  false,
+		},
+		{
+			name:  "duplicates in slice same unique elements",
+			slice: []string{"a", "a", "b"},
+			set:   map[string]struct{}{"a": {}, "b": {}},
+			want:  true,
+		},
+		{
+			name:  "duplicates in slice missing set element",
+			slice: []string{"a", "a"},
+			set:   map[string]struct{}{"a": {}, "b": {}},
+			want:  false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sliceEqualsSet(tc.slice, tc.set)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}

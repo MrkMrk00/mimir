@@ -98,8 +98,6 @@ EQLC
 EQL_REGEX
 GTE
 GTR
-TRIM_UPPER
-TRIM_LOWER
 LAND
 LOR
 LSS
@@ -202,7 +200,7 @@ START_METRIC_SELECTOR
 // Operators are listed with increasing precedence.
 %left LOR
 %left LAND LUNLESS
-%left EQLC GTE GTR LSS LTE NEQ TRIM_UPPER TRIM_LOWER
+%left EQLC GTE GTR LSS LTE NEQ
 %left ADD SUB
 %left MUL DIV MOD ATAN2
 %right POW
@@ -293,8 +291,6 @@ binary_expr     : expr ADD     bin_modifier expr { $$ = yylex.(*parser).newBinar
                 | expr EQLC    bin_modifier expr { $$ = yylex.(*parser).newBinaryExpression($1, $2, $3, $4) }
                 | expr GTE     bin_modifier expr { $$ = yylex.(*parser).newBinaryExpression($1, $2, $3, $4) }
                 | expr GTR     bin_modifier expr { $$ = yylex.(*parser).newBinaryExpression($1, $2, $3, $4) }
-                | expr TRIM_UPPER   bin_modifier expr { $$ = yylex.(*parser).newBinaryExpression($1, $2, $3, $4) }
-                | expr TRIM_LOWER   bin_modifier expr { $$ = yylex.(*parser).newBinaryExpression($1, $2, $3, $4) }
                 | expr LAND    bin_modifier expr { $$ = yylex.(*parser).newBinaryExpression($1, $2, $3, $4) }
                 | expr LOR     bin_modifier expr { $$ = yylex.(*parser).newBinaryExpression($1, $2, $3, $4) }
                 | expr LSS     bin_modifier expr { $$ = yylex.(*parser).newBinaryExpression($1, $2, $3, $4) }

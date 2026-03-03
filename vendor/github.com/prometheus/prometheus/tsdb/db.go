@@ -45,11 +45,11 @@ import (
 	_ "github.com/prometheus/prometheus/tsdb/goversion" // Load the package into main to make sure minimum Go version is met.
 	"github.com/prometheus/prometheus/tsdb/hashcache"
 	"github.com/prometheus/prometheus/tsdb/index"
+	"github.com/prometheus/prometheus/tsdb/seriesmetadata"
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"github.com/prometheus/prometheus/tsdb/wlog"
 	"github.com/prometheus/prometheus/util/compression"
 	"github.com/prometheus/prometheus/util/features"
-	prom_runtime "github.com/prometheus/prometheus/util/runtime"
 )
 
 const (
@@ -142,11 +142,6 @@ type Options struct {
 	// the size of the WAL folder which is not added when calculating
 	// the current size of the database.
 	MaxBytes int64
-
-	// Maximum % of disk space to use for blocks to be retained.
-	// 0 or less means disabled.
-	// If both MaxBytes and MaxPercentage are set, percentage prevails.
-	MaxPercentage uint
 
 	// NoLockfile disables creation and consideration of a lock file.
 	NoLockfile bool
@@ -356,6 +351,21 @@ type Options struct {
 	// is implemented.
 	EnableMetadataWALRecords bool
 
+	// EnableNativeMetadata represents 'native-metadata' feature flag.
+	// When enabled, OTel resource/scope attributes are persisted per time series
+	// in Parquet-based metadata files alongside TSDB blocks.
+	EnableNativeMetadata bool
+
+	// IndexedResourceAttrs specifies additional descriptive resource attribute
+	// names to include in the inverted index beyond identifying attributes
+	// (which are always indexed). nil means index only identifying attributes.
+	IndexedResourceAttrs map[string]struct{}
+
+	// EnableResourceAttrIndex enables the resource attribute inverted index
+	// for O(1) reverse lookup by attribute key:value. When disabled, the index
+	// is not built in memory or written to Parquet. Default: true.
+	EnableResourceAttrIndex bool
+
 	// BlockCompactionExcludeFunc is a function which returns true for blocks that should NOT be compacted.
 	// It's passed down to the TSDB compactor.
 	BlockCompactionExcludeFunc BlockExcludeFilterFunc
@@ -369,9 +379,6 @@ type Options struct {
 	// StaleSeriesCompactionThreshold is a number between 0.0-1.0 indicating the % of stale series in
 	// the in-memory Head block. If the % of stale series crosses this threshold, stale series compaction is run immediately.
 	StaleSeriesCompactionThreshold float64
-
-	// FsSizeFunc is a function returning the total disk size for a given path.
-	FsSizeFunc FsSizeFunc
 }
 
 type NewCompactorFunc func(ctx context.Context, r prometheus.Registerer, l *slog.Logger, ranges []int64, pool chunkenc.Pool, opts *Options) (Compactor, error)
@@ -381,8 +388,6 @@ type BlocksToDeleteFunc func(blocks []*Block) map[ulid.ULID]struct{}
 type BlockQuerierFunc func(b BlockReader, mint, maxt int64) (storage.Querier, error)
 
 type BlockChunkQuerierFunc func(b BlockReader, mint, maxt int64) (storage.ChunkQuerier, error)
-
-type FsSizeFunc func(path string) uint64
 
 type IndexLookupPlannerFunc func(meta BlockMeta, reader IndexReader) index.LookupPlanner
 
@@ -450,10 +455,22 @@ type DB struct {
 
 	blockChunkQuerierFunc BlockChunkQuerierFunc
 
-	fsSizeFunc FsSizeFunc
-
 	// blockPostingsForMatchersCacheFactory returns a factory for creating PostingsForMatchersCache instances for compacted blocks.
 	blockPostingsForMatchersCacheFactory PostingsForMatchersCacheFactory
+
+	// Blocks-only metadata cache — avoids re-merging blocks on every request.
+	// metadataCache is read lock-free via atomic load; metadataBuildMtx prevents
+	// thundering herd on cache miss. Head data is layered on top at query time.
+	metadataCache    atomic.Value // stores *metadataCacheEntry
+	metadataBuildMtx sync.Mutex
+}
+
+// metadataCacheEntry holds the cached blocks-only merged metadata reader.
+// The cache is keyed solely by block ULIDs — it never expires for the same
+// block set. Head metadata is always served live via layered reader.
+type metadataCacheEntry struct {
+	reader    seriesmetadata.Reader
+	blocksKey string // sorted block ULIDs fingerprint
 }
 
 type dbMetrics struct {
@@ -470,11 +487,11 @@ type dbMetrics struct {
 	tombCleanTimer                  prometheus.Histogram
 	blocksBytes                     prometheus.Gauge
 	maxBytes                        prometheus.Gauge
-	maxPercentage                   prometheus.Gauge
 	retentionDuration               prometheus.Gauge
 	staleSeriesCompactionsTriggered prometheus.Counter
 	staleSeriesCompactionsFailed    prometheus.Counter
 	staleSeriesCompactionDuration   prometheus.Histogram
+	seriesMetadataBytes             prometheus.Gauge
 }
 
 func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
@@ -551,10 +568,6 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Name: "prometheus_tsdb_retention_limit_bytes",
 		Help: "Max number of bytes to be retained in the tsdb blocks, configured 0 means disabled",
 	})
-	m.maxPercentage = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "prometheus_tsdb_retention_limit_percentage",
-		Help: "Max percentage of total storage space to be retained in the tsdb blocks, configured 0 means disabled",
-	})
 	m.retentionDuration = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_retention_limit_seconds",
 		Help: "How long to retain samples in storage.",
@@ -579,6 +592,10 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		NativeHistogramMaxBucketNumber:  100,
 		NativeHistogramMinResetDuration: 1 * time.Hour,
 	})
+	m.seriesMetadataBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "prometheus_tsdb_storage_series_metadata_bytes",
+		Help: "The number of bytes used by series metadata (Parquet) files across all blocks.",
+	})
 
 	if r != nil {
 		r.MustRegister(
@@ -595,11 +612,11 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 			m.tombCleanTimer,
 			m.blocksBytes,
 			m.maxBytes,
-			m.maxPercentage,
 			m.retentionDuration,
 			m.staleSeriesCompactionsTriggered,
 			m.staleSeriesCompactionsFailed,
 			m.staleSeriesCompactionDuration,
+			m.seriesMetadataBytes,
 		)
 	}
 	return m
@@ -801,7 +818,6 @@ func (db *DBReadOnly) loadDataAsQueryable(maxt int64) (storage.SampleAndChunkQue
 		head:                  head,
 		blockQuerierFunc:      NewBlockQuerier,
 		blockChunkQuerierFunc: NewBlockChunkQuerier,
-		fsSizeFunc:            prom_runtime.FsSize,
 	}, nil
 }
 
@@ -1132,6 +1148,9 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 			PD:                          opts.PostingsDecoderFactory,
 			UseUncachedIO:               opts.UseUncachedIO,
 			BlockExcludeFilter:          opts.BlockCompactionExcludeFunc,
+			EnableNativeMetadata:        opts.EnableNativeMetadata,
+			IndexedResourceAttrs:        opts.IndexedResourceAttrs,
+			EnableResourceAttrIndex:     opts.EnableResourceAttrIndex,
 		})
 	}
 	if err != nil {
@@ -1168,12 +1187,6 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 			PostingsClonerFactory: opts.PostingsClonerFactory,
 		}
 		db.blockPostingsForMatchersCacheFactory = NewPostingsForMatchersCacheFactory(config)
-	}
-
-	if opts.FsSizeFunc == nil {
-		db.fsSizeFunc = prom_runtime.FsSize
-	} else {
-		db.fsSizeFunc = opts.FsSizeFunc
 	}
 
 	var wal, wbl *wlog.WL
@@ -1241,6 +1254,9 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 	}
 	headOpts.EnableSTAsZeroSample = opts.EnableSTAsZeroSample
 	headOpts.EnableMetadataWALRecords = opts.EnableMetadataWALRecords
+	headOpts.EnableNativeMetadata = opts.EnableNativeMetadata
+	headOpts.IndexedResourceAttrs = opts.IndexedResourceAttrs
+	headOpts.EnableResourceAttrIndex = opts.EnableResourceAttrIndex
 	if opts.WALReplayConcurrency > 0 {
 		headOpts.WALReplayConcurrency = opts.WALReplayConcurrency
 	}
@@ -1258,7 +1274,6 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 	db.metrics = newDBMetrics(db, r)
 	maxBytes := max(opts.MaxBytes, 0)
 	db.metrics.maxBytes.Set(float64(maxBytes))
-	db.metrics.maxPercentage.Set(float64(max(opts.MaxPercentage, 0)))
 	db.metrics.retentionDuration.Set((time.Duration(opts.RetentionDuration) * time.Millisecond).Seconds())
 
 	// Calling db.reload() calls db.reloadBlocks() which requires cmtx to be locked.
@@ -1336,6 +1351,128 @@ func (db *DB) BlockMetas() []BlockMeta {
 		metas = append(metas, b.Meta())
 	}
 	return metas
+}
+
+// cachedMetadataReader wraps a Reader and ignores Close() calls,
+// since the underlying reader is shared across callers via the cache.
+type cachedMetadataReader struct {
+	seriesmetadata.Reader
+}
+
+func (*cachedMetadataReader) Close() error { return nil }
+
+// SeriesMetadata returns a layered reader combining blocks (cached) and head (live).
+// Returns an empty reader when native metadata is not enabled.
+//
+// The blocks-only cache never expires for the same block set — it invalidates
+// only on compaction/block reload. Head metadata updates are immediately
+// visible without waiting for any TTL.
+//
+// NOTE: The returned reader's ref values are labels hashes, NOT series refs.
+// The merged result spans multiple indexes so no single series ref is valid.
+// Callers should use the resource/scope iteration methods.
+func (db *DB) SeriesMetadata() (seriesmetadata.Reader, error) {
+	if !db.opts.EnableNativeMetadata {
+		return seriesmetadata.NewMemSeriesMetadata(), nil
+	}
+
+	// Build fingerprint from current block set.
+	blocks := db.Blocks()
+	blocksKey := blocksFingerprint(blocks)
+
+	// Fast path: check blocks cache atomically (no lock, no TTL).
+	var blocksMerged seriesmetadata.Reader
+	if v := db.metadataCache.Load(); v != nil {
+		if entry := v.(*metadataCacheEntry); entry.blocksKey == blocksKey {
+			blocksMerged = entry.reader
+		}
+	}
+
+	if blocksMerged == nil {
+		// Cache miss — acquire build mutex to prevent thundering herd.
+		db.metadataBuildMtx.Lock()
+
+		// Re-check after acquiring lock.
+		if v := db.metadataCache.Load(); v != nil {
+			if entry := v.(*metadataCacheEntry); entry.blocksKey == blocksKey {
+				blocksMerged = entry.reader
+			}
+		}
+		if blocksMerged == nil {
+			merged, err := db.mergeBlockMetadata(blocks)
+			if err != nil {
+				db.metadataBuildMtx.Unlock()
+				return nil, err
+			}
+			db.metadataCache.Store(&metadataCacheEntry{
+				reader:    merged,
+				blocksKey: blocksKey,
+			})
+			blocksMerged = merged
+		}
+		db.metadataBuildMtx.Unlock()
+	}
+
+	headReader, err := db.head.SeriesMetadata()
+	if err != nil {
+		return nil, err
+	}
+
+	return seriesmetadata.NewLayeredReader(&cachedMetadataReader{blocksMerged}, headReader), nil
+}
+
+// blocksFingerprint builds a cache key from sorted block ULIDs.
+func blocksFingerprint(blocks []*Block) string {
+	if len(blocks) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, blk := range blocks {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(blk.Meta().ULID.String())
+	}
+	return b.String()
+}
+
+// mergeBlockMetadata merges metadata from all blocks into a single reader.
+// Head metadata is not included — it is layered on top at query time.
+func (db *DB) mergeBlockMetadata(blocks []*Block) (seriesmetadata.Reader, error) {
+	merged := seriesmetadata.NewMemSeriesMetadata()
+
+	for _, b := range blocks {
+		mr, err := b.SeriesMetadata()
+		if err != nil {
+			return nil, fmt.Errorf("get block series metadata: %w", err)
+		}
+
+		for _, kind := range seriesmetadata.AllKinds() {
+			err = mr.IterKind(context.Background(), kind.ID(), func(labelsHash uint64, versioned any) error {
+				store := merged.StoreForKind(kind.ID())
+				kind.SetVersioned(store, labelsHash, versioned)
+				if _, exists := merged.LabelsForHash(labelsHash); !exists {
+					if lset, ok := mr.LabelsForHash(labelsHash); ok {
+						merged.SetLabels(labelsHash, lset)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				mr.Close()
+				return nil, fmt.Errorf("iterate block %s: %w", kind.ID(), err)
+			}
+		}
+		mr.Close()
+	}
+
+	// Build inverted index for blocks. With Fix 3.3 (per-block Parquet index),
+	// blocks read from new Parquet files already have the index populated and
+	// BuildResourceAttrIndex skips. Only old-format blocks need runtime build.
+	if db.opts.EnableResourceAttrIndex {
+		merged.BuildResourceAttrIndex()
+	}
+	return merged, nil
 }
 
 func (db *DB) run(ctx context.Context) {
@@ -1452,10 +1589,6 @@ func (db *DB) ApplyConfig(conf *config.Config) error {
 				db.opts.MaxBytes = int64(conf.StorageConfig.TSDBConfig.Retention.Size)
 				db.metrics.maxBytes.Set(float64(db.opts.MaxBytes))
 			}
-			if conf.StorageConfig.TSDBConfig.Retention.Percentage > 0 {
-				db.opts.MaxPercentage = conf.StorageConfig.TSDBConfig.Retention.Percentage
-				db.metrics.maxPercentage.Set(float64(db.opts.MaxPercentage))
-			}
 			db.retentionMtx.Unlock()
 		}
 	} else {
@@ -1501,11 +1634,11 @@ func (db *DB) getRetentionDuration() int64 {
 	return db.opts.RetentionDuration
 }
 
-// getRetentionSettings returns max bytes and max percentage settings in a thread-safe manner.
-func (db *DB) getRetentionSettings() (int64, uint) {
+// getMaxBytes returns the current max bytes setting in a thread-safe manner.
+func (db *DB) getMaxBytes() int64 {
 	db.retentionMtx.RLock()
 	defer db.retentionMtx.RUnlock()
-	return db.opts.MaxBytes, db.opts.MaxPercentage
+	return db.opts.MaxBytes
 }
 
 // dbAppender wraps the DB's head appender and triggers compactions on commit
@@ -2049,8 +2182,9 @@ func (db *DB) reloadBlocks() (err error) {
 	}
 
 	var (
-		toLoad     []*Block
-		blocksSize int64
+		toLoad             []*Block
+		blocksSize         int64
+		seriesMetadataSize int64
 	)
 	// All deletable blocks should be unloaded.
 	// NOTE: We need to loop through loadable one more time as there might be loadable ready to be removed (replaced by compacted block).
@@ -2062,8 +2196,10 @@ func (db *DB) reloadBlocks() (err error) {
 
 		toLoad = append(toLoad, block)
 		blocksSize += block.Size()
+		seriesMetadataSize += block.numBytesSeriesMetadata
 	}
 	db.metrics.blocksBytes.Set(float64(blocksSize))
+	db.metrics.seriesMetadataBytes.Set(float64(seriesMetadataSize))
 
 	slices.SortFunc(toLoad, func(a, b *Block) int {
 		switch {
@@ -2207,25 +2343,9 @@ func BeyondTimeRetention(db *DB, blocks []*Block) (deletable map[ulid.ULID]struc
 // BeyondSizeRetention returns those blocks which are beyond the size retention
 // set in the db options.
 func BeyondSizeRetention(db *DB, blocks []*Block) (deletable map[ulid.ULID]struct{}) {
-	// No blocks to work with
-	if len(blocks) == 0 {
-		return deletable
-	}
-
-	maxBytes, maxPercentage := db.getRetentionSettings()
-
-	// Max percentage prevails over max size.
-	if maxPercentage > 0 {
-		diskSize := db.fsSizeFunc(db.dir)
-		if diskSize <= 0 {
-			db.logger.Warn("Unable to retrieve filesystem size of database directory, skip percentage limitation and default to fixed size limitation", "dir", db.dir)
-		} else {
-			maxBytes = int64(uint64(maxPercentage) * diskSize / 100)
-		}
-	}
-
-	// Size retention is disabled.
-	if maxBytes <= 0 {
+	// Size retention is disabled or no blocks to work with.
+	maxBytes := db.getMaxBytes()
+	if len(blocks) == 0 || maxBytes <= 0 {
 		return deletable
 	}
 

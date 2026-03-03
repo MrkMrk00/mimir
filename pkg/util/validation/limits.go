@@ -217,23 +217,24 @@ type Limits struct {
 	EnableDelayedNameRemoval              bool           `yaml:"enable_delayed_name_removal" json:"enable_delayed_name_removal" category:"experimental"`
 
 	// Query-frontend limits.
-	MaxTotalQueryLength                    model.Duration         `yaml:"max_total_query_length" json:"max_total_query_length"`
-	ResultsCacheTTL                        model.Duration         `yaml:"results_cache_ttl" json:"results_cache_ttl"`
-	ResultsCacheTTLForOutOfOrderTimeWindow model.Duration         `yaml:"results_cache_ttl_for_out_of_order_time_window" json:"results_cache_ttl_for_out_of_order_time_window"`
-	ResultsCacheTTLForCardinalityQuery     model.Duration         `yaml:"results_cache_ttl_for_cardinality_query" json:"results_cache_ttl_for_cardinality_query"`
-	ResultsCacheTTLForLabelsQuery          model.Duration         `yaml:"results_cache_ttl_for_labels_query" json:"results_cache_ttl_for_labels_query"`
-	ResultsCacheTTLForErrors               model.Duration         `yaml:"results_cache_ttl_for_errors" json:"results_cache_ttl_for_errors"`
-	ResultsCacheForUnalignedQueryEnabled   bool                   `yaml:"cache_unaligned_requests" json:"cache_unaligned_requests" category:"advanced"`
-	MaxQueryExpressionSizeBytes            int                    `yaml:"max_query_expression_size_bytes" json:"max_query_expression_size_bytes"`
-	BlockedQueries                         BlockedQueriesConfig   `yaml:"blocked_queries,omitempty" json:"blocked_queries,omitempty" doc:"nocli|description=List of queries to block."`
-	LimitedQueries                         LimitedQueriesConfig   `yaml:"limited_queries,omitempty" json:"limited_queries,omitempty" doc:"nocli|description=List of queries to limit and duration to limit them for." category:"experimental"`
-	BlockedRequests                        BlockedRequestsConfig  `yaml:"blocked_requests,omitempty" json:"blocked_requests,omitempty" doc:"nocli|description=List of HTTP requests to block." category:"experimental"`
-	AlignQueriesWithStep                   bool                   `yaml:"align_queries_with_step" json:"align_queries_with_step"`
-	EnabledPromQLExperimentalFunctions     flagext.StringSliceCSV `yaml:"enabled_promql_experimental_functions" json:"enabled_promql_experimental_functions"`
-	EnabledPromQLExtendedRangeSelectors    flagext.StringSliceCSV `yaml:"enabled_promql_extended_range_selectors" json:"enabled_promql_extended_range_selectors"`
-	Prom2RangeCompat                       bool                   `yaml:"prom2_range_compat" json:"prom2_range_compat" category:"experimental"`
-	SubquerySpinOffEnabled                 bool                   `yaml:"subquery_spin_off_enabled" json:"subquery_spin_off_enabled" category:"experimental"`
-	LabelsQueryOptimizerEnabled            bool                   `yaml:"labels_query_optimizer_enabled" json:"labels_query_optimizer_enabled" category:"advanced"`
+	MaxTotalQueryLength                       model.Duration         `yaml:"max_total_query_length" json:"max_total_query_length"`
+	ResultsCacheTTL                           model.Duration         `yaml:"results_cache_ttl" json:"results_cache_ttl"`
+	ResultsCacheTTLForOutOfOrderTimeWindow    model.Duration         `yaml:"results_cache_ttl_for_out_of_order_time_window" json:"results_cache_ttl_for_out_of_order_time_window"`
+	ResultsCacheTTLForCardinalityQuery        model.Duration         `yaml:"results_cache_ttl_for_cardinality_query" json:"results_cache_ttl_for_cardinality_query"`
+	ResultsCacheTTLForLabelsQuery             model.Duration         `yaml:"results_cache_ttl_for_labels_query" json:"results_cache_ttl_for_labels_query"`
+	ResultsCacheTTLForResourceAttributesQuery model.Duration         `yaml:"results_cache_ttl_for_resource_attributes_query" json:"results_cache_ttl_for_resource_attributes_query"`
+	ResultsCacheTTLForErrors                  model.Duration         `yaml:"results_cache_ttl_for_errors" json:"results_cache_ttl_for_errors"`
+	ResultsCacheForUnalignedQueryEnabled      bool                   `yaml:"cache_unaligned_requests" json:"cache_unaligned_requests" category:"advanced"`
+	MaxQueryExpressionSizeBytes               int                    `yaml:"max_query_expression_size_bytes" json:"max_query_expression_size_bytes"`
+	BlockedQueries                            BlockedQueriesConfig   `yaml:"blocked_queries,omitempty" json:"blocked_queries,omitempty" doc:"nocli|description=List of queries to block."`
+	LimitedQueries                            LimitedQueriesConfig   `yaml:"limited_queries,omitempty" json:"limited_queries,omitempty" doc:"nocli|description=List of queries to limit and duration to limit them for." category:"experimental"`
+	BlockedRequests                           BlockedRequestsConfig  `yaml:"blocked_requests,omitempty" json:"blocked_requests,omitempty" doc:"nocli|description=List of HTTP requests to block." category:"experimental"`
+	AlignQueriesWithStep                      bool                   `yaml:"align_queries_with_step" json:"align_queries_with_step"`
+	EnabledPromQLExperimentalFunctions        flagext.StringSliceCSV `yaml:"enabled_promql_experimental_functions" json:"enabled_promql_experimental_functions"`
+	EnabledPromQLExtendedRangeSelectors       flagext.StringSliceCSV `yaml:"enabled_promql_extended_range_selectors" json:"enabled_promql_extended_range_selectors"`
+	Prom2RangeCompat                          bool                   `yaml:"prom2_range_compat" json:"prom2_range_compat" category:"experimental"`
+	SubquerySpinOffEnabled                    bool                   `yaml:"subquery_spin_off_enabled" json:"subquery_spin_off_enabled" category:"experimental"`
+	LabelsQueryOptimizerEnabled               bool                   `yaml:"labels_query_optimizer_enabled" json:"labels_query_optimizer_enabled" category:"advanced"`
 
 	// Cardinality
 	CardinalityAnalysisEnabled                    bool `yaml:"cardinality_analysis_enabled" json:"cardinality_analysis_enabled"`
@@ -319,6 +320,9 @@ type Limits struct {
 	OTelTranslationStrategy                  OTelTranslationStrategyValue `yaml:"otel_translation_strategy" json:"otel_translation_strategy" category:"experimental"`
 	OTelLabelNameUnderscoreSanitization      bool                         `yaml:"otel_label_name_underscore_sanitization" json:"otel_label_name_underscore_sanitization" category:"advanced"`
 	OTelLabelNamePreserveMultipleUnderscores bool                         `yaml:"otel_label_name_preserve_multiple_underscores" json:"otel_label_name_preserve_multiple_underscores" category:"advanced"`
+	OTelPersistResourceAttributes            bool                         `yaml:"otel_persist_resource_attributes" json:"otel_persist_resource_attributes" category:"experimental"`
+	OTelResourceAttrIndexEnabled             bool                         `yaml:"otel_resource_attr_index_enabled" json:"otel_resource_attr_index_enabled" category:"experimental"`
+	OTelIndexedResourceAttributes            flagext.StringSliceCSV       `yaml:"otel_indexed_resource_attributes" json:"otel_indexed_resource_attributes" category:"experimental"`
 
 	// Ingest storage.
 	IngestStorageReadConsistency       string `yaml:"ingest_storage_read_consistency" json:"ingest_storage_read_consistency" category:"experimental"`
@@ -376,6 +380,9 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&l.OTelTranslationStrategy, "distributor.otel-translation-strategy", fmt.Sprintf("Translation strategy to apply in OTLP endpoint for metric and label names. If unspecified (the default), the strategy is derived from -validation.name-validation-scheme and -distributor.otel-metric-suffixes-enabled. Supported values: %s.", strings.Join([]string{`""`, string(otlptranslator.UnderscoreEscapingWithSuffixes), string(otlptranslator.UnderscoreEscapingWithoutSuffixes), string(otlptranslator.NoUTF8EscapingWithSuffixes), string(otlptranslator.NoTranslation)}, ", ")))
 	f.BoolVar(&l.OTelLabelNameUnderscoreSanitization, "distributor.otel-label-name-underscore-sanitization", true, "If enabled, prefixes label names starting with a single underscore with `key_` when translating OTel attribute names. Defaults to true.")
 	f.BoolVar(&l.OTelLabelNamePreserveMultipleUnderscores, "distributor.otel-label-name-preserve-underscores", true, "If enabled, keeps multiple consecutive underscores in label names when translating OTel attribute names. Defaults to true.")
+	f.BoolVar(&l.OTelPersistResourceAttributes, "distributor.otel-persist-resource-attributes", false, "Whether to persist OTel resource attributes per time series as metadata in Prometheus TSDB blocks. Resource attributes are stored in series_metadata.parquet files within blocks and can be queried via the /api/v1/resource_attributes endpoint.")
+	f.BoolVar(&l.OTelResourceAttrIndexEnabled, "ingester.otel-resource-attr-index-enabled", false, "Enable the in-memory resource attribute inverted index for O(1) reverse lookup by attribute key:value. When disabled, the index is not built in memory or written to Parquet during compaction.")
+	f.Var(&l.OTelIndexedResourceAttributes, "ingester.otel-indexed-resource-attributes", "Comma-separated list of additional descriptive resource attribute names to include in the inverted index. Identifying attributes (service.name, service.namespace, service.instance.id) are always indexed when the index is enabled.")
 
 	f.Var(&l.IngestionArtificialDelay, "distributor.ingestion-artificial-delay", "Target ingestion delay to apply to all tenants. If set to a non-zero value, the distributor will artificially delay ingestion time-frame by the specified duration by computing the difference between actual ingestion and the target. There is no delay on actual ingestion of samples, it is only the response back to the client.")
 
@@ -484,6 +491,7 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&l.ResultsCacheTTLForOutOfOrderTimeWindow, resultsCacheTTLForOutOfOrderWindowFlag, fmt.Sprintf("Time to live duration for cached query results if query falls into out-of-order time window. This is lower than -%s so that incoming out-of-order samples are returned in the query results sooner.", resultsCacheTTLFlag))
 	f.Var(&l.ResultsCacheTTLForCardinalityQuery, "query-frontend.results-cache-ttl-for-cardinality-query", "Time to live duration for cached cardinality query results. The value 0 disables the cache.")
 	f.Var(&l.ResultsCacheTTLForLabelsQuery, "query-frontend.results-cache-ttl-for-labels-query", "Time to live duration for cached label names and label values query results. The value 0 disables the cache.")
+	f.Var(&l.ResultsCacheTTLForResourceAttributesQuery, "query-frontend.results-cache-ttl-for-resource-attributes-query", "Time to live duration for cached resource attributes query results. The value 0 disables the cache.")
 	_ = l.ResultsCacheTTLForErrors.Set("5m")
 	f.Var(&l.ResultsCacheTTLForErrors, "query-frontend.results-cache-ttl-for-errors", "Time to live duration for cached non-transient errors")
 	f.BoolVar(&l.ResultsCacheForUnalignedQueryEnabled, "query-frontend.cache-unaligned-requests", false, "Cache requests that are not step-aligned.")
@@ -1515,6 +1523,10 @@ func (o *Overrides) ResultsCacheTTLForLabelsQuery(user string) time.Duration {
 	return time.Duration(o.getOverridesForUser(user).ResultsCacheTTLForLabelsQuery)
 }
 
+func (o *Overrides) ResultsCacheTTLForResourceAttributesQuery(user string) time.Duration {
+	return time.Duration(o.getOverridesForUser(user).ResultsCacheTTLForResourceAttributesQuery)
+}
+
 func (o *Overrides) ResultsCacheTTLForErrors(user string) time.Duration {
 	return time.Duration(o.getOverridesForUser(user).ResultsCacheTTLForErrors)
 }
@@ -1596,6 +1608,21 @@ func (o *Overrides) OTelLabelNameUnderscoreSanitization(tenantID string) bool {
 
 func (o *Overrides) OTelLabelNamePreserveMultipleUnderscores(tenantID string) bool {
 	return o.getOverridesForUser(tenantID).OTelLabelNamePreserveMultipleUnderscores
+}
+
+// OTelPersistResourceAttributes returns whether OTel resource attributes should be persisted per time series.
+func (o *Overrides) OTelPersistResourceAttributes(tenantID string) bool {
+	return o.getOverridesForUser(tenantID).OTelPersistResourceAttributes
+}
+
+// OTelResourceAttrIndexEnabled returns whether the resource attribute inverted index is enabled.
+func (o *Overrides) OTelResourceAttrIndexEnabled(tenantID string) bool {
+	return o.getOverridesForUser(tenantID).OTelResourceAttrIndexEnabled
+}
+
+// OTelIndexedResourceAttributes returns additional descriptive resource attribute names to index.
+func (o *Overrides) OTelIndexedResourceAttributes(tenantID string) flagext.StringSliceCSV {
+	return o.getOverridesForUser(tenantID).OTelIndexedResourceAttributes
 }
 
 // DistributorIngestionArtificialDelay returns the artificial ingestion latency for a given user.
