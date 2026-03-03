@@ -3,14 +3,17 @@
 package ingester
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/oklog/ulid/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/tsdb"
-	"go.uber.org/atomic"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
 const (
@@ -29,13 +32,11 @@ func (o offsetWatermark) String() string {
 	return fmt.Sprintf("%d/%d", o.Partition, o.Offset)
 }
 
-type offsetCatalogueData struct {
-	Version int                        `json:"version"`
-	Data    map[string]offsetWatermark `json:"data"`
-}
+//type offsetCatalogueData struct {
+//	Version int                        `json:"version"`
+//	Data    map[string]offsetWatermark `json:"data"`
+//}
 
-// offsetCatalogue tracks the mapping of block ULID (or __head__) to the Kafka offset watermark
-// at the time the TSDB was compacted.
 type offsetCatalogue struct {
 	logger log.Logger
 	dir    string
@@ -77,23 +78,22 @@ func (c *offsetCatalogue) Load() error {
 //	panic("not implemented")
 //}
 
-func (c *offsetCatalogue) GetHead() (offsetWatermark, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	wm, ok := c.data[offsetCatalogueBlockHead]
-	return wm, ok
-}
-
-func (c *offsetCatalogue) SetHead(wm offsetWatermark) {
-	c.set(offsetCatalogueBlockHead, wm)
-}
+//func (c *offsetCatalogue) GetHead() (offsetWatermark, bool) {
+//	c.mu.Lock()
+//	defer c.mu.Unlock()
+//
+//	wm, ok := c.data[offsetCatalogueBlockHead]
+//	return wm, ok
+//}
+//
+//func (c *offsetCatalogue) SetHead(wm offsetWatermark) {
+//	c.set(offsetCatalogueBlockHead, wm)
+//}
 
 func (c *offsetCatalogue) Set(key string, wm offsetWatermark) {
 	c.set(key, wm)
 }
 
-// Set stores or updates the watermark for the given key.
 func (c *offsetCatalogue) set(key string, wm offsetWatermark) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -102,17 +102,38 @@ func (c *offsetCatalogue) set(key string, wm offsetWatermark) {
 	c.dirty = true
 }
 
+func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue, partition int32, headBlockOffset int64) tsdb.NewCompactorFunc {
+	return func(ctx context.Context, r prometheus.Registerer, l *slog.Logger, ranges []int64, pool chunkenc.Pool, opts *tsdb.Options) (tsdb.Compactor, error) {
+		compactor, err := tsdb.NewLeveledCompactorWithOptions(ctx, r, l, ranges, pool, tsdb.LeveledCompactorOptions{
+			MaxBlockChunkSegmentSize:    opts.MaxBlockChunkSegmentSize,
+			EnableOverlappingCompaction: opts.EnableOverlappingCompaction,
+			PD:                          opts.PostingsDecoderFactory,
+			UseUncachedIO:               opts.UseUncachedIO,
+			BlockExcludeFilter:          opts.BlockCompactionExcludeFunc,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		tsdbCompactor := newTSDBCompactor(compactor, catalogue, partition)
+		db.tsdbCompactor = tsdbCompactor
+
+		// Seeds the tsdbCompactor with previous head block offset, if available. This is so blocks created during post-WAL replay head compaction
+		// were attributed to the offset, that points at where the head was before the DB was closed -- not what's commited now.
+		tsdbCompactor.SetOffset(headBlockOffset)
+
+		return tsdbCompactor, nil
+	}
+}
+
 // tsdbCompactor wraps a tsdb.Compactor to record the Kafka offset watermark for each newly compacted block
 // in the offset catalogue.
-//
-// Before each compaction tick the caller sets the watermark via SetOffset. New blocks produced during compaction
-// are stamped with that watermark.
 type tsdbCompactor struct {
 	compactor tsdb.Compactor
 	catalogue *offsetCatalogue
 
 	partition int32
-	offset    atomic.Int64
+	offset    int64
 }
 
 var _ tsdb.Compactor = (*tsdbCompactor)(nil)
@@ -127,7 +148,7 @@ func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue, part
 
 // SetOffset sets the offset watermark that will be stamped on new blocks.
 func (c *tsdbCompactor) SetOffset(offset int64) {
-	c.offset.Store(offset)
+	c.offset = offset
 }
 
 func (c *tsdbCompactor) Plan(dir string) ([]string, error) {
@@ -167,7 +188,7 @@ func (c *tsdbCompactor) updateCatalogue(ulids []ulid.ULID) {
 	}
 	wm := offsetWatermark{
 		Partition: c.partition,
-		Offset:    c.offset.Load(),
+		Offset:    c.offset,
 	}
 	for _, id := range ulids {
 		c.catalogue.Set(id.String(), wm)

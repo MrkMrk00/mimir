@@ -95,9 +95,10 @@ type PartitionReader struct {
 	// consumed up until the end of the partition. This timestamp is used the compute the consumption delay.
 	highestConsumedTimestampBeforePartitionEnd *atomic.Time
 
-	logger         log.Logger
-	reg            prometheus.Registerer
-	lastSeenOffset int64
+	logger log.Logger
+	reg    prometheus.Registerer
+
+	lastSeenOffset atomic.Int64
 }
 
 func NewPartitionReaderForPusher(kafkaCfg KafkaConfig, partitionID int32, instanceID string, offsetFilePath string, pusher Pusher, logger log.Logger, reg prometheus.Registerer) (*PartitionReader, error) {
@@ -181,6 +182,10 @@ func (r *PartitionReader) EstimatedBytesPerRecord() int64 {
 	return 0
 }
 
+func (r *PartitionReader) LastSeenOffset() int64 {
+	return r.lastSeenOffset.Load()
+}
+
 func (r *PartitionReader) LastCommittedOffset() int64 {
 	return r.committer.LastCommittedOffset()
 }
@@ -205,7 +210,7 @@ func (r *PartitionReader) start(ctx context.Context) (returnErr error) {
 	}
 
 	// lastConsumedOffset could be a special negative offset (e.g. partition start, or partition end).
-	r.lastSeenOffset = lastConsumedOffset
+	r.lastSeenOffset.Store(lastConsumedOffset)
 	// Initialise the last consumed offset only if we've got an actual offset from the consumer group.
 	if lastConsumedOffset >= 0 {
 		r.consumedOffsetWatcher.Notify(lastConsumedOffset)
@@ -338,9 +343,11 @@ func (r *PartitionReader) processNextFetches(ctx context.Context, receiveDelayOb
 	r.logFetchErrors(fetches)
 	fetches = filterOutErrFetches(fetches)
 
-	// instrument only after we've done all pre-processing of records. We don't expect the set of records to change beyond this point.
-	instrumentGaps(findGapsInRecords(fetches, r.lastSeenOffset), r.metrics.missedRecords, r.logger)
-	r.lastSeenOffset = max(r.lastSeenOffset, lastOffset(fetches))
+	// Instrument only after we've done all pre-processing of records. We don't expect the set of records to change beyond this point.
+	// This is the only place that updates r.lastSeenOffset.
+	lastSeenOffset := r.lastSeenOffset.Load()
+	instrumentGaps(findGapsInRecords(fetches, lastSeenOffset), r.metrics.missedRecords, r.logger)
+	r.lastSeenOffset.Store(max(lastSeenOffset, lastOffset(fetches)))
 
 	r.updateHighestConsumedTimestampBeforeConsumption(fetches)
 	err := r.consumeFetches(ctx, fetches)

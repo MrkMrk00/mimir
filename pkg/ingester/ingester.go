@@ -14,7 +14,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
 	"math"
 	"math/rand"
 	"net/http"
@@ -47,7 +46,6 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
-	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/hashcache"
 	"github.com/prometheus/prometheus/tsdb/index"
@@ -2751,41 +2749,15 @@ func (i *Ingester) createTSDB(userID string, walReplayConcurrency int) (*userTSD
 		return userDB.blocksToDelete(blocks)
 	}
 
-	// When ingest storage is enabled, set up the offset catalogue and compactor
-	// wrapper so that compacted blocks are tagged with the Kafka offset watermark.
-	var catalogue *offsetCatalogue
+	// When ingest storage is enabled, set up the compactor wrapper so that compacted blocks
+	// are tagged with the Kafka offset watermark.
 	var newCompactorFunc tsdb.NewCompactorFunc
 	if i.ingestReader != nil {
-		catalogue = newOffsetCatalogue(userLogger, udir, userID)
-		if err := catalogue.Load(); err != nil {
-			return nil, fmt.Errorf("load offset catalogue: %w", err)
-		}
+		catalogue := newOffsetCatalogue(userLogger, udir, userID)
 
-		offset := int64(-1)
-		if head, ok := catalogue.GetHead(); ok {
-			offset = head.Offset
-		}
+		userDB.offsetCatalogue = catalogue
 
-		newCompactorFunc = func(ctx context.Context, r prometheus.Registerer, l *slog.Logger, ranges []int64, pool chunkenc.Pool, opts *tsdb.Options) (tsdb.Compactor, error) {
-			compactor, err := tsdb.NewLeveledCompactorWithOptions(ctx, r, l, ranges, pool, tsdb.LeveledCompactorOptions{
-				MaxBlockChunkSegmentSize:    opts.MaxBlockChunkSegmentSize,
-				EnableOverlappingCompaction: opts.EnableOverlappingCompaction,
-				PD:                          opts.PostingsDecoderFactory,
-				UseUncachedIO:               opts.UseUncachedIO,
-				BlockExcludeFilter:          opts.BlockCompactionExcludeFunc,
-			})
-			if err != nil {
-				return nil, err
-			}
-			tsdbCompactor := newTSDBCompactor(compactor, catalogue, i.ingestPartitionID)
-			userDB.tsdbCompactor = tsdbCompactor
-
-			// Seeds the tsdbCompactor with previous head block offset, if available. This is so blocks created during post-WAL replay head compaction
-			// were attributed to the offset, that points at where the head was before the DB was closed -- not what's commited now.
-			tsdbCompactor.SetOffset(offset)
-
-			return tsdbCompactor, nil
-		}
+		newCompactorFunc = tsdbCompactorFactory(userDB, catalogue, i.ingestPartitionID, i.ingestReader.LastSeenOffset())
 	}
 
 	oooTW := i.limits.OutOfOrderTimeWindow(userID)
@@ -2853,7 +2825,6 @@ func (i *Ingester) createTSDB(userID string, walReplayConcurrency int) (*userTSD
 	//}
 
 	userDB.db = db
-	userDB.offsetCatalogue = catalogue
 	userDBHasDB.Store(true)
 	// We set the limiter here because we don't want to limit
 	// series during WAL replay.
@@ -3286,7 +3257,7 @@ func (i *Ingester) compactionServiceRunning(ctx context.Context) error {
 			// clearing the read-only mode. See [Ingester.PrepareInstanceRingDownscaleHandler]
 			i.numCompactionsInProgress.Inc()
 
-			//i.setCompactionWatermark()
+			i.setCompactionWatermark()
 
 			// The forcedCompactionMaxTime has no meaning because force=false.
 			i.compactBlocks(ctx, false, 0, nil)
@@ -3425,7 +3396,7 @@ func (i *Ingester) setCompactionWatermark() {
 	if i.ingestReader == nil {
 		return
 	}
-	offset := i.ingestReader.LastCommittedOffset()
+	offset := i.ingestReader.LastSeenOffset()
 	for _, userID := range i.getTSDBUsers() {
 		userDB := i.getTSDB(userID)
 		if userDB == nil {
@@ -4607,34 +4578,11 @@ func timeUntilCompaction(now time.Time, compactionInterval, zoneOffset time.Dura
 func (i *Ingester) NotifyPreCommit(ctx context.Context) error {
 	level.Debug(i.logger).Log("msg", "fsyncing TSDBs", "concurrency", i.cfg.IngestStorageConfig.WriteLogsFsyncBeforeKafkaCommitConcurrency)
 
-	//// Holds the current stable offset, that is safe to mark all block heads with in user's offset catalogue (see below).
-	//var watermark offsetWatermark
-	//if i.ingestReader != nil {
-	//	watermark = offsetWatermark{
-	//		Partition: i.ingestPartitionID,
-	//		Offset:    i.ingestReader.LastCommittedOffset(),
-	//	}
-	//}
-	//
-	//maybeUpdateCatalogueHead := func(db *userTSDB) {
-	//	if db.offsetCatalogue != nil {
-	//		db.offsetCatalogue.SetHead(watermark)
-	//	}
-	//}
-
-	// Holds the current stable offset, that is safe to mark all block heads with in user's offset catalogue (see below).
-	offset := i.ingestReader.LastCommittedOffset()
-
 	return concurrency.ForEachUser(ctx, i.getTSDBUsers(), i.cfg.IngestStorageConfig.WriteLogsFsyncBeforeKafkaCommitConcurrency, func(ctx context.Context, userID string) error {
 		db := i.getTSDB(userID)
 		if db == nil {
 			return nil
 		}
-
-		// This is noop if the db wasn't bound to an offset catalogue.
-		//maybeUpdateCatalogueHead(db)
-
-		db.tsdbCompactor.SetOffset(offset)
 
 		if err := db.Head().FsyncWLSegments(); err != nil {
 			return err
