@@ -5,19 +5,14 @@ package ingester
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
+	"time"
 
 	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/runutil"
-	"github.com/oklog/ulid/v2"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/tsdb"
-	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
 	"github.com/grafana/mimir/pkg/util/atomicfs"
 	"github.com/grafana/mimir/pkg/util/spanlogger"
@@ -37,49 +32,38 @@ func (o offsetWatermark) String() string {
 }
 
 type offsetCatalogueData struct {
-	Version int                        `json:"version"`
-	Data    map[string]offsetWatermark `json:"data"`
-}
-
-type offsetReader interface {
-	LastSeenOffset() int64
+	Version   int                        `json:"version"`
+	UpdatedAt int64                      `json:"updated_at"`
+	Data      map[string]offsetWatermark `json:"data"`
 }
 
 type offsetCatalogue struct {
-	logger log.Logger
-	dir    string
-	userID string
-
+	logger    log.Logger
+	dir       string
+	userID    string
 	partition int32
-
-	offsetReader offsetReader
-
-	mu   sync.Mutex
-	data map[string]offsetWatermark
 }
 
-func newOffsetCatalogue(logger log.Logger, dir, userID string, partition int32, offsetReader offsetReader) *offsetCatalogue {
+func newOffsetCatalogue(logger log.Logger, dir, userID string, partition int32) *offsetCatalogue {
 	return &offsetCatalogue{
-		logger: logger,
-		dir:    dir,
-		userID: userID,
-
-		partition:    partition,
-		offsetReader: offsetReader,
+		logger:    logger,
+		dir:       dir,
+		userID:    userID,
+		partition: partition,
 	}
 }
 
 const offsetCatalogueFilename = "offset-catalogue.json"
 
-func (c *offsetCatalogue) Sync(ctx context.Context) error {
+func (c *offsetCatalogue) Sync(ctx context.Context, offsetHW int64) error {
 	spanLogger, ctx := spanlogger.New(ctx, c.logger, tracer, "Ingester.OffsetCatalogue.Sync")
 	defer spanLogger.Finish()
 
-	// If block was cut from the head and discovered in this sync, all its series are guaranteed to come from below this offset.
-	offsetHW := c.offsetReader.LastSeenOffset()
-
 	oldData, err := readOffsetCatalogueFromFile(c.dir)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
+		// The catalogue file may not exist if that's the first sync of this new tenant.
+		oldData.Data = map[string]offsetWatermark{}
+	} else if err != nil {
 		return fmt.Errorf("read offset catalogue: %w", err)
 	}
 
@@ -91,14 +75,10 @@ func (c *offsetCatalogue) Sync(ctx context.Context) error {
 		blocks[id.String()] = struct{}{}
 	}
 
-	c.mu.Lock()
-	catalogueData := c.data
-	clear(c.data)
-	c.mu.Unlock()
-
 	data := offsetCatalogueData{
-		Version: offsetCatalogueVersion,
-		Data:    make(map[string]offsetWatermark, len(blocks)),
+		Version:   offsetCatalogueVersion,
+		UpdatedAt: time.Now().Unix(),
+		Data:      make(map[string]offsetWatermark, len(blocks)),
 	}
 	for id := range blocks {
 		if mark, ok := oldData.Data[id]; ok {
@@ -106,27 +86,16 @@ func (c *offsetCatalogue) Sync(ctx context.Context) error {
 			data.Data[id] = mark
 			continue
 		}
-		mark, ok := catalogueData[id]
-		if !ok || mark.Offset < 0 {
-			// If block wasn't found in the catalogue (e.g. block existed before start),
-			// or block's watermark offset wasn't captured, fallback to the most recent offsetHW.
-			// This is conservative: if block was found on disk, its data came from offset lower than current offsetHW.
-			mark = offsetWatermark{
-				Partition: c.partition,
-				Offset:    offsetHW,
-			}
-		} else if mark.Offset > offsetHW {
-			level.Warn(spanLogger).Log("msg", "found unexpected offset watermark", "user", c.userID, "block", id, "partition", mark.Partition, "offset", mark.Offset, "last_seen_offset", offsetHW)
-			continue
+		// If block wasn't found in the catalogue (e.g. block existed before start),
+		// or block's watermark offset wasn't captured, fallback to the most recent offsetHW.
+		// This is conservative: if block was found on disk, its data came from offset lower than current offsetHW.
+		data.Data[id] = offsetWatermark{
+			Partition: c.partition,
+			Offset:    offsetHW,
 		}
-		data.Data[id] = mark
 	}
 
-	if err := writeOffsetCatalogueToFile(c.logger, c.dir, data); err != nil {
-		level.Warn(spanLogger).Log("msg", "writing offset catalogue failed", "user", c.userID, "err", err)
-	}
-
-	return nil
+	return writeOffsetCatalogueToFile(c.dir, data)
 }
 
 func readOffsetCatalogueFromFile(dir string) (offsetCatalogueData, error) {
@@ -146,7 +115,7 @@ func readOffsetCatalogueFromFile(dir string) (offsetCatalogueData, error) {
 	return data, nil
 }
 
-func writeOffsetCatalogueToFile(logger log.Logger, dir string, data offsetCatalogueData) (err error) {
+func writeOffsetCatalogueToFile(dir string, data offsetCatalogueData) (err error) {
 	filePath := filepath.Join(dir, offsetCatalogueFilename)
 
 	f, err := atomicfs.Create(filePath)
@@ -159,88 +128,7 @@ func writeOffsetCatalogueToFile(logger log.Logger, dir string, data offsetCatalo
 	enc.SetIndent("", "\t")
 
 	if err := enc.Encode(data); err != nil {
-		return err
+		return fmt.Errorf("encode data to file %s: %w", filePath, err)
 	}
 	return nil
-}
-
-func (c *offsetCatalogue) SetOffset(key string, offset int64) {
-	mark := offsetWatermark{
-		Partition: c.partition,
-		Offset:    offset,
-	}
-	c.mu.Lock()
-	c.data[key] = mark
-	c.mu.Unlock()
-}
-
-func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue) tsdb.NewCompactorFunc {
-	return func(ctx context.Context, r prometheus.Registerer, l *slog.Logger, ranges []int64, pool chunkenc.Pool, opts *tsdb.Options) (tsdb.Compactor, error) {
-		compactor, err := tsdb.NewLeveledCompactorWithOptions(ctx, r, l, ranges, pool, tsdb.LeveledCompactorOptions{
-			MaxBlockChunkSegmentSize:    opts.MaxBlockChunkSegmentSize,
-			EnableOverlappingCompaction: opts.EnableOverlappingCompaction,
-			PD:                          opts.PostingsDecoderFactory,
-			UseUncachedIO:               opts.UseUncachedIO,
-			BlockExcludeFilter:          opts.BlockCompactionExcludeFunc,
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		tsdbCompactor := newTSDBCompactor(compactor, catalogue)
-		db.tsdbCompactor = tsdbCompactor
-
-		return tsdbCompactor, nil
-	}
-}
-
-// tsdbCompactor wraps a tsdb.Compactor to record the Kafka offset watermark for each newly compacted block
-// in the offset catalogue.
-type tsdbCompactor struct {
-	compactor tsdb.Compactor
-	catalogue *offsetCatalogue
-}
-
-var _ tsdb.Compactor = (*tsdbCompactor)(nil)
-
-func newTSDBCompactor(compactor tsdb.Compactor, catalogue *offsetCatalogue) *tsdbCompactor {
-	return &tsdbCompactor{
-		compactor: compactor,
-		catalogue: catalogue,
-	}
-}
-
-func (c *tsdbCompactor) Plan(dir string) ([]string, error) {
-	return c.compactor.Plan(dir)
-}
-
-func (c *tsdbCompactor) Write(dest string, b tsdb.BlockReader, mint, maxt int64, base *tsdb.BlockMeta) ([]ulid.ULID, error) {
-	return c.compactAndUpdateCatalogue(func() ([]ulid.ULID, error) {
-		return c.compactor.Write(dest, b, mint, maxt, base)
-	})
-}
-
-func (c *tsdbCompactor) Compact(dest string, dirs []string, open []*tsdb.Block) ([]ulid.ULID, error) {
-	return c.compactAndUpdateCatalogue(func() ([]ulid.ULID, error) {
-		return c.compactor.Compact(dest, dirs, open)
-	})
-}
-
-func (c *tsdbCompactor) CompactOOO(dest string, oooHead *tsdb.OOOCompactionHead) ([]ulid.ULID, error) {
-	return c.compactAndUpdateCatalogue(func() ([]ulid.ULID, error) {
-		return c.compactor.CompactOOO(dest, oooHead)
-	})
-}
-
-func (c *tsdbCompactor) compactAndUpdateCatalogue(compactFunc func() ([]ulid.ULID, error)) ([]ulid.ULID, error) {
-	// Record the last seen offset before running the compaction func. The "seen" records are already in the head by this time.
-	offset := c.catalogue.offsetReader.LastSeenOffset()
-	ulids, err := compactFunc()
-	if err != nil {
-		return ulids, err
-	}
-	for _, id := range ulids {
-		c.catalogue.SetOffset(id.String(), offset)
-	}
-	return ulids, nil
 }

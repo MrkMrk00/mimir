@@ -148,10 +148,8 @@ type userTSDB struct {
 	ownedTokenRanges ring.TokenRanges
 
 	// offsetCatalogue tracks Kafka offset watermarks for compacted blocks.
-	// tsdbCompactor wraps the TSDB compactor to record watermarks.
 	// Only set when ingest storage is enabled.
 	offsetCatalogue *offsetCatalogue
-	tsdbCompactor   *tsdbCompactor
 
 	requiresOwnedSeriesUpdate atomic.String // Non-empty string means that we need to recompute "owned series" for the user. Value will be used in the log message.
 
