@@ -140,22 +140,21 @@ func (b *TSDBBuilder) PushToStorageAndReleaseRequest(ctx context.Context, req *m
 
 		ingestCreatedTimestamp := ts.CreatedTimestamp > 0
 
+		metricName := nonCopiedLabels.Get(model.MetricNameLabel)
+
 		// Build resource context once per time series.
 		var resourceCtx *storage.ResourceContext
-		if ts.ResourceAttributes != nil && len(ts.ResourceAttributes.Identifying) > 0 {
-			metricName := nonCopiedLabels.Get(model.MetricNameLabel)
-			if metricName != "target_info" {
-				resourceCtx = &storage.ResourceContext{
-					Identifying: entriesToMap(ts.ResourceAttributes.Identifying),
-					Descriptive: entriesToMap(ts.ResourceAttributes.Descriptive),
-					Entities:    convertResourceEntities(ts.ResourceAttributes.Entities),
-				}
+		if ts.ResourceAttributes != nil && len(ts.ResourceAttributes.Identifying) > 0 && metricName != "target_info" {
+			resourceCtx = &storage.ResourceContext{
+				Identifying: entriesToMap(ts.ResourceAttributes.Identifying),
+				Descriptive: entriesToMap(ts.ResourceAttributes.Descriptive),
+				Entities:    convertResourceEntities(ts.ResourceAttributes.Entities),
 			}
 		}
 
 		// Build scope context once per time series.
 		var scopeCtx *storage.ScopeContext
-		if ts.ScopeAttributes != nil {
+		if ts.ScopeAttributes != nil && metricName != "target_info" {
 			if ts.ScopeAttributes.Name != "" || ts.ScopeAttributes.Version != "" || ts.ScopeAttributes.SchemaURL != "" || len(ts.ScopeAttributes.Attrs) > 0 {
 				scopeCtx = &storage.ScopeContext{
 					Name:      ts.ScopeAttributes.Name,

@@ -705,6 +705,10 @@ func (l *Limits) Validate() error {
 		return fmt.Errorf("early_head_compaction_min_estimated_series_reduction_percentage must be between 0 and 100")
 	}
 
+	if l.OTelResourceAttrIndexEnabled && !l.OTelPersistResourceAttributes {
+		return fmt.Errorf("otel_resource_attr_index_enabled requires otel_persist_resource_attributes to be enabled")
+	}
+
 	// Validate additional custom tracker config doesn't exceed the limit.
 	if err := l.ActiveSeriesAdditionalCustomTrackersConfig.Validate(l.MaxActiveSeriesAdditionalCustomTrackers); err != nil {
 		return fmt.Errorf("active_series_additional_custom_trackers validation failed: %w", err)

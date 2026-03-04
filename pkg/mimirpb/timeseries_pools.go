@@ -88,7 +88,41 @@ func ReuseTimeseries(ts *TimeSeries) {
 
 	ts.CreatedTimestamp = 0
 	ts.SkipUnmarshalingExemplars = false
+
+	// Clear string fields in ResourceAttributes/ScopeAttributes that may reference
+	// gRPC buffers before releasing the pointer, matching the Labels pattern above.
+	if ts.ResourceAttributes != nil {
+		for i := range ts.ResourceAttributes.Identifying {
+			ts.ResourceAttributes.Identifying[i].Key = ""
+			ts.ResourceAttributes.Identifying[i].Value = ""
+		}
+		for i := range ts.ResourceAttributes.Descriptive {
+			ts.ResourceAttributes.Descriptive[i].Key = ""
+			ts.ResourceAttributes.Descriptive[i].Value = ""
+		}
+		for i := range ts.ResourceAttributes.Entities {
+			ts.ResourceAttributes.Entities[i].Type = ""
+			for j := range ts.ResourceAttributes.Entities[i].ID {
+				ts.ResourceAttributes.Entities[i].ID[j].Key = ""
+				ts.ResourceAttributes.Entities[i].ID[j].Value = ""
+			}
+			for j := range ts.ResourceAttributes.Entities[i].Description {
+				ts.ResourceAttributes.Entities[i].Description[j].Key = ""
+				ts.ResourceAttributes.Entities[i].Description[j].Value = ""
+			}
+		}
+	}
 	ts.ResourceAttributes = nil
+
+	if ts.ScopeAttributes != nil {
+		ts.ScopeAttributes.Name = ""
+		ts.ScopeAttributes.Version = ""
+		ts.ScopeAttributes.SchemaURL = ""
+		for i := range ts.ScopeAttributes.Attrs {
+			ts.ScopeAttributes.Attrs[i].Key = ""
+			ts.ScopeAttributes.Attrs[i].Value = ""
+		}
+	}
 	ts.ScopeAttributes = nil
 
 	ClearExemplars(ts)

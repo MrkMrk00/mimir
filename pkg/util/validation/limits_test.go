@@ -1891,6 +1891,26 @@ func TestLimits_Validate(t *testing.T) {
 			}(),
 			expectedErr: errors.New(`invalid cost attribution output label: "service:__my_service__"`),
 		},
+		"should fail if otel_resource_attr_index_enabled is set without otel_persist_resource_attributes": {
+			cfg: func() Limits {
+				cfg := Limits{}
+				flagext.DefaultValues(&cfg)
+				cfg.OTelResourceAttrIndexEnabled = true
+				cfg.OTelPersistResourceAttributes = false
+				return cfg
+			}(),
+			expectedErr: errors.New("otel_resource_attr_index_enabled requires otel_persist_resource_attributes to be enabled"),
+		},
+		"should pass if both otel_resource_attr_index_enabled and otel_persist_resource_attributes are set": {
+			cfg: func() Limits {
+				cfg := Limits{}
+				flagext.DefaultValues(&cfg)
+				cfg.OTelResourceAttrIndexEnabled = true
+				cfg.OTelPersistResourceAttributes = true
+				return cfg
+			}(),
+			expectedErr: nil,
+		},
 	}
 
 	for testName, testData := range tests {

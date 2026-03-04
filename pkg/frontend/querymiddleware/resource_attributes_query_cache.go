@@ -74,15 +74,17 @@ func generateResourceAttributesQueryCacheKey(path string, values url.Values) (st
 		b              = strings.Builder{}
 	)
 
-	// Parse start/end times. When missing, default to MinTime/MaxTime
-	// to match labels cache behaviour and ensure consistent cache keys.
+	// Parse start/end times. When missing, default to MinTime / now.
+	// Unlike the labels cache (which uses MaxTime for open-ended queries),
+	// the resource attributes handler defaults end=now, so we must use
+	// time.Now() here to produce a cache key that changes over time.
 	startTime, _ := util.ParseTime(values.Get("start"))
 	if startTime == 0 {
 		startTime = v1.MinTime.UnixMilli()
 	}
 	endTime, _ := util.ParseTime(values.Get("end"))
 	if endTime == 0 {
-		endTime = v1.MaxTime.UnixMilli()
+		endTime = time.Now().UnixMilli()
 	}
 
 	// Align to 2-hour block boundaries (same as labels cache).
@@ -91,10 +93,8 @@ func generateResourceAttributesQueryCacheKey(path string, values url.Values) (st
 			startTime -= remainder
 		}
 	}
-	if endTime != v1.MaxTime.UnixMilli() {
-		if remainder := endTime % twoHoursMillis; remainder != 0 {
-			endTime += twoHoursMillis - remainder
-		}
+	if remainder := endTime % twoHoursMillis; remainder != 0 {
+		endTime += twoHoursMillis - remainder
 	}
 
 	b.WriteString(strconv.FormatInt(startTime, 10))

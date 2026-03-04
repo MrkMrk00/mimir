@@ -65,6 +65,7 @@ type ResourceAttributesBlocksQueryable interface {
 type ResourceAttributesHandlerConfig struct {
 	QueryStoreAfter      time.Duration
 	QueryIngestersWithin func(userID string) time.Duration
+	MaxQueryLookback     func(userID string) time.Duration
 }
 
 // NewResourceAttributesHandler creates a http.Handler for the /api/v1/resources endpoint.
@@ -145,6 +146,16 @@ func NewResourceAttributesHandler(d Distributor, blocksQueryable ResourceAttribu
 		// Default endMs to now if not specified
 		if endMs == 0 {
 			endMs = nowMs
+		}
+
+		// Apply max query lookback to avoid scanning all blocks since epoch.
+		if cfg.MaxQueryLookback != nil {
+			if maxLookback := cfg.MaxQueryLookback(tenantID); maxLookback > 0 {
+				earliest := nowMs - maxLookback.Milliseconds()
+				if startMs < earliest {
+					startMs = earliest
+				}
+			}
 		}
 
 		// Query both ingesters and store-gateways in parallel
@@ -340,17 +351,25 @@ func mergeResourceAttributesSeries(ingesterSeries, storeSeries []*SeriesResource
 		}
 	}
 
-	// Convert map back to slice
-	result := make([]*SeriesResourceAttributesData, 0, len(seriesMap))
-	for _, s := range seriesMap {
-		result = append(result, s)
+	// Convert map back to slice, pre-computing sort keys to avoid
+	// recomputing labelsMapToKey O(N log N) times during sort.
+	type keyed struct {
+		key  string
+		data *SeriesResourceAttributesData
+	}
+	keyedResult := make([]keyed, 0, len(seriesMap))
+	for key, s := range seriesMap {
+		keyedResult = append(keyedResult, keyed{key: key, data: s})
 	}
 
-	// Sort by labels for consistent ordering
-	sort.Slice(result, func(i, j int) bool {
-		return labelsMapToKey(result[i].Labels) < labelsMapToKey(result[j].Labels)
+	sort.Slice(keyedResult, func(i, j int) bool {
+		return keyedResult[i].key < keyedResult[j].key
 	})
 
+	result := make([]*SeriesResourceAttributesData, len(keyedResult))
+	for i, k := range keyedResult {
+		result[i] = k.data
+	}
 	return result
 }
 
@@ -375,9 +394,11 @@ func labelsMapToKey(lbls map[string]string) string {
 
 // mergeResourceVersions merges and deduplicates resource versions from two sources.
 func mergeResourceVersions(a, b []*ResourceVersionData) []*ResourceVersionData {
-	// Simple merge: append and sort by time
-	// In the future, we could deduplicate overlapping time ranges
-	all := append(a, b...)
+	// Simple merge: combine into a new slice and sort by time.
+	// In the future, we could deduplicate overlapping time ranges.
+	all := make([]*ResourceVersionData, 0, len(a)+len(b))
+	all = append(all, a...)
+	all = append(all, b...)
 
 	// Sort by MinTimeMs
 	sort.Slice(all, func(i, j int) bool {
@@ -471,6 +492,16 @@ func NewResourceAttributesSeriesHandler(d Distributor, blocksQueryable ResourceA
 
 		if endMs == 0 {
 			endMs = nowMs
+		}
+
+		// Apply max query lookback to avoid scanning all blocks since epoch.
+		if cfg.MaxQueryLookback != nil {
+			if maxLookback := cfg.MaxQueryLookback(tenantID); maxLookback > 0 {
+				earliest := nowMs - maxLookback.Milliseconds()
+				if startMs < earliest {
+					startMs = earliest
+				}
+			}
 		}
 
 		g, gCtx := errgroup.WithContext(ctx)

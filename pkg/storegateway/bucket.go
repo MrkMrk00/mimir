@@ -1663,38 +1663,104 @@ func (s *BucketStore) ResourceAttributes(req *storepb.ResourceAttributesRequest,
 	return sendResourceAttributesBatched(srv, deduped, resourceAttributesMaxSizeBytes)
 }
 
-// bucketReaderAt implements io.ReaderAt over an object storage bucket,
-// translating ReadAt calls into GetRange requests.
-type bucketReaderAt struct {
-	ctx  context.Context
-	bkt  objstore.BucketReader
-	name string
+// maxPrefetchBytes is the maximum size of a series_metadata.parquet file
+// that we'll load into memory. Files larger than this are rejected to
+// guard against OOM from unexpectedly large or corrupt objects.
+const maxPrefetchBytes = 256 << 20 // 256 MiB
+
+// prefetchedReaderAt fetches the entire object into memory and serves
+// ReadAt from the buffer. This avoids 150+ HTTP range requests that
+// parquet-go would otherwise issue when lazily reading footer, page
+// indices, bloom filters, column chunks and pages.
+type prefetchedReaderAt struct {
+	data []byte
 }
 
-func (r *bucketReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	rc, err := r.bkt.GetRange(r.ctx, r.name, off, int64(len(p)))
+func newPrefetchedReaderAt(ctx context.Context, bkt objstore.BucketReader, name string, size int64) (*prefetchedReaderAt, error) {
+	if size > maxPrefetchBytes {
+		return nil, fmt.Errorf("series metadata file too large to prefetch: %d bytes (max %d)", size, maxPrefetchBytes)
+	}
+	rc, err := bkt.GetRange(ctx, name, 0, size)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer rc.Close()
-	return io.ReadFull(rc, p)
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(rc, buf); err != nil {
+		return nil, err
+	}
+	return &prefetchedReaderAt{data: buf}, nil
+}
+
+func (r *prefetchedReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 || off >= int64(len(r.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// cachedParquetReader returns the prefetched series_metadata.parquet data,
+// fetching and caching it on first access. Returns (nil, 0, nil) if the
+// file does not exist or is empty.
+func (b *bucketBlock) cachedParquetReader(ctx context.Context) (*prefetchedReaderAt, int64, error) {
+	b.parquetMu.Lock()
+	if b.parquetReader != nil {
+		r, s := b.parquetReader, b.parquetSize
+		b.parquetMu.Unlock()
+		return r, s, nil
+	}
+	if b.parquetNoFile {
+		b.parquetMu.Unlock()
+		return nil, 0, nil
+	}
+	b.parquetMu.Unlock()
+
+	// Fetch outside the lock. Concurrent fetches for the same block are
+	// possible but rare (gated by queryGate) and harmless — only one is stored.
+	parquetPath := path.Join(b.meta.ULID.String(), seriesmetadata.SeriesMetadataFilename)
+	attrs, err := b.bkt.Attributes(ctx, parquetPath)
+	if err != nil {
+		if b.bkt.IsObjNotFoundErr(err) {
+			b.parquetMu.Lock()
+			b.parquetNoFile = true
+			b.parquetMu.Unlock()
+			return nil, 0, nil
+		}
+		return nil, 0, err
+	}
+	if attrs.Size == 0 {
+		b.parquetMu.Lock()
+		b.parquetNoFile = true
+		b.parquetMu.Unlock()
+		return nil, 0, nil
+	}
+
+	reader, err := newPrefetchedReaderAt(ctx, b.bkt, parquetPath, attrs.Size)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	b.parquetMu.Lock()
+	if b.parquetReader == nil {
+		b.parquetReader = reader
+		b.parquetSize = attrs.Size
+	}
+	r, s := b.parquetReader, b.parquetSize
+	b.parquetMu.Unlock()
+	return r, s, nil
 }
 
 // blockResourceAttributes reads resource attributes for matching series from a single block.
 func (s *BucketStore) blockResourceAttributes(ctx context.Context, b *bucketBlock, matchers []*labels.Matcher, startMs, endMs int64, limit int64) ([]*storepb.ResourceAttributesSeriesData, error) {
-	// Read the series metadata parquet file from object storage
-	parquetPath := path.Join(b.meta.ULID.String(), seriesmetadata.SeriesMetadataFilename)
-
-	// Get file size via Attributes (needed by parquet reader for footer).
-	attrs, err := b.bkt.Attributes(ctx, parquetPath)
+	readerAt, size, err := b.cachedParquetReader(ctx)
 	if err != nil {
-		if b.bkt.IsObjNotFoundErr(err) {
-			// No series metadata file - this is expected for older blocks
-			return nil, nil
-		}
-		return nil, errors.Wrap(err, "get series metadata attributes")
+		return nil, errors.Wrap(err, "get parquet reader")
 	}
-	if attrs.Size == 0 {
+	if readerAt == nil {
 		return nil, nil
 	}
 
@@ -1731,26 +1797,31 @@ func (s *BucketStore) blockResourceAttributes(ctx context.Context, b *bucketBloc
 	}
 
 	// Step 2: Stream resource data from Parquet, skipping non-matching refs.
-	readerAt := &bucketReaderAt{ctx: ctx, bkt: b.bkt, name: parquetPath}
-	pf, err := seriesmetadata.OpenParquetFile(readerAt, attrs.Size)
+	pf, err := seriesmetadata.OpenParquetFile(util_log.SlogFromGoKit(s.logger), readerAt, size)
 	if err != nil {
 		return nil, errors.Wrap(err, "open parquet file")
 	}
 	resourcesByPostingRef := make(map[uint64][]*storepb.ResourceVersionData)
+	minTimeMs := int64(math.MinInt64)
+	if startMs > 0 {
+		minTimeMs = startMs
+	}
+	maxTimeMs := int64(math.MaxInt64)
+	if endMs > 0 {
+		maxTimeMs = endMs
+	}
 	err = seriesmetadata.StreamVersionedResourcesFromFile(util_log.SlogFromGoKit(s.logger), pf,
-		func(seriesRef uint64, vr *seriesmetadata.VersionedResource) error {
+		seriesmetadata.WithSeriesRefFilter(func(seriesRef uint64) bool {
+			_, ok := postingsSet[seriesRef*parquetRefMultiplier]
+			return ok
+		}),
+		seriesmetadata.WithTimeRange(minTimeMs, maxTimeMs),
+		seriesmetadata.WithOnVersionedResource(func(seriesRef uint64, vr *seriesmetadata.VersionedResource) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			ref := seriesRef * parquetRefMultiplier
 			for _, rv := range vr.Versions {
-				// Filter versions by time range.
-				if endMs > 0 && rv.MinTime > endMs {
-					continue
-				}
-				if startMs > 0 && rv.MaxTime < startMs {
-					continue
-				}
 				var entities []*storepb.EntityData
 				for _, e := range rv.Entities {
 					entities = append(entities, &storepb.EntityData{
@@ -1768,11 +1839,7 @@ func (s *BucketStore) blockResourceAttributes(ctx context.Context, b *bucketBloc
 				})
 			}
 			return nil
-		},
-		func(seriesRef uint64) bool {
-			_, ok := postingsSet[seriesRef*parquetRefMultiplier]
-			return ok
-		})
+		}))
 	if err != nil {
 		return nil, errors.Wrap(err, "stream resource attributes from parquet")
 	}
@@ -1851,24 +1918,16 @@ func (s *BucketStore) blockResourceAttributes(ctx context.Context, b *bucketBloc
 // blockResourceAttributesByFilter reads resource attributes for series matching resource attribute filters from a single block.
 // It uses the inverted index (resource_attr_index namespace) for reverse lookup.
 func (s *BucketStore) blockResourceAttributesByFilter(ctx context.Context, b *bucketBlock, filters []*storepb.ResourceAttrFilter, startMs, endMs int64, limit int64) ([]*storepb.ResourceAttributesSeriesData, error) {
-	// Read the series metadata parquet file with full resource data (includes inverted index)
-	parquetPath := path.Join(b.meta.ULID.String(), seriesmetadata.SeriesMetadataFilename)
-
-	attrs, err := b.bkt.Attributes(ctx, parquetPath)
+	readerAt, size, err := b.cachedParquetReader(ctx)
 	if err != nil {
-		if b.bkt.IsObjNotFoundErr(err) {
-			return nil, nil
-		}
-		return nil, errors.Wrap(err, "get series metadata attributes")
+		return nil, errors.Wrap(err, "get parquet reader")
 	}
-	if attrs.Size == 0 {
+	if readerAt == nil {
 		return nil, nil
 	}
 
-	readerAt := &bucketReaderAt{ctx: ctx, bkt: b.bkt, name: parquetPath}
-
 	// Open the Parquet file once and share across both streaming passes.
-	pf, err := seriesmetadata.OpenParquetFile(readerAt, attrs.Size)
+	pf, err := seriesmetadata.OpenParquetFile(util_log.SlogFromGoKit(s.logger), readerAt, size)
 	if err != nil {
 		return nil, errors.Wrap(err, "open parquet file")
 	}
@@ -1905,8 +1964,8 @@ func (s *BucketStore) blockResourceAttributesByFilter(ctx context.Context, b *bu
 		filterLookup[f.GetKey()][f.GetValue()] = append(filterLookup[f.GetKey()][f.GetValue()], i)
 	}
 
-	err = seriesmetadata.StreamResourceAttrIndexFromFile(util_log.SlogFromGoKit(s.logger), pf,
-		func(seriesRef uint64, key, value string) error {
+	err = seriesmetadata.StreamResourceAttrIndexFromFile(pf,
+		seriesmetadata.WithOnAttrIndexEntry(func(key, value string, seriesRef uint64) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -1919,7 +1978,7 @@ func (s *BucketStore) blockResourceAttributesByFilter(ctx context.Context, b *bu
 				}
 			}
 			return nil
-		})
+		}))
 	if err != nil {
 		return nil, errors.Wrap(err, "stream resource attr index")
 	}
@@ -1952,25 +2011,29 @@ func (s *BucketStore) blockResourceAttributesByFilter(ctx context.Context, b *bu
 	}
 	seenVersions := make(map[uint64]map[versionKey]struct{})
 
+	minTimeMs := int64(math.MinInt64)
+	if startMs > 0 {
+		minTimeMs = startMs
+	}
+	maxTimeMs := int64(math.MaxInt64)
+	if endMs > 0 {
+		maxTimeMs = endMs
+	}
 	err = seriesmetadata.StreamVersionedResourcesFromFile(util_log.SlogFromGoKit(s.logger), pf,
-		func(parquetRef uint64, vr *seriesmetadata.VersionedResource) error {
+		seriesmetadata.WithSeriesRefFilter(func(seriesRef uint64) bool {
+			_, ok := matchingHashes[seriesRef*parquetRefMultiplier]
+			return ok
+		}),
+		seriesmetadata.WithTimeRange(minTimeMs, maxTimeMs),
+		seriesmetadata.WithOnVersionedResource(func(parquetRef uint64, vr *seriesmetadata.VersionedResource) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			ref := parquetRef * parquetRefMultiplier
-			if _, ok := matchingHashes[ref]; !ok {
-				return nil
-			}
 
 			var filteredVersions []*storepb.ResourceVersionData
 			seen := seenVersions[ref]
 			for _, rv := range vr.Versions {
-				if endMs > 0 && rv.MinTime > endMs {
-					continue
-				}
-				if startMs > 0 && rv.MaxTime < startMs {
-					continue
-				}
 				vk := versionKey{rv.MinTime, rv.MaxTime}
 				if seen != nil {
 					if _, dup := seen[vk]; dup {
@@ -2012,11 +2075,7 @@ func (s *BucketStore) blockResourceAttributesByFilter(ctx context.Context, b *bu
 			}
 			existing.Versions = append(existing.Versions, filteredVersions...)
 			return nil
-		},
-		func(seriesRef uint64) bool {
-			_, ok := matchingHashes[seriesRef*parquetRefMultiplier]
-			return ok
-		})
+		}))
 	if err != nil {
 		return nil, errors.Wrap(err, "stream versioned resources")
 	}
@@ -2611,6 +2670,13 @@ type bucketBlock struct {
 
 	// Indicates whether the block was queried.
 	queried atomic.Bool
+
+	// Cached prefetched series_metadata.parquet data.
+	// Protected by parquetMu; nil means not yet loaded.
+	parquetMu     sync.Mutex
+	parquetReader *prefetchedReaderAt
+	parquetSize   int64
+	parquetNoFile bool // true if series_metadata.parquet doesn't exist for this block
 }
 
 func newBucketBlock(
@@ -2752,6 +2818,11 @@ func (b *bucketBlock) Close() error {
 	b.closedMtx.Unlock()
 
 	b.pendingReaders.Wait()
+
+	b.parquetMu.Lock()
+	b.parquetReader = nil
+	b.parquetNoFile = false
+	b.parquetMu.Unlock()
 
 	return b.indexHeaderReader.Close()
 }

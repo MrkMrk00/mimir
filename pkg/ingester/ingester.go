@@ -999,6 +999,10 @@ func (i *Ingester) updateIndexedResourceAttrs() {
 // sliceEqualsSet reports whether the slice and set contain the same unique elements.
 // The slice may contain duplicates.
 func sliceEqualsSet(slice []string, set map[string]struct{}) bool {
+	// Fast path: if the slice has fewer elements than the set, they can't be equal.
+	if len(slice) < len(set) {
+		return false
+	}
 	// Check slice⊆set and count unique slice elements in one pass.
 	seen := make(map[string]struct{}, len(slice))
 	for _, s := range slice {

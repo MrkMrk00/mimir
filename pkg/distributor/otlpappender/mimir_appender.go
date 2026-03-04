@@ -27,6 +27,37 @@ type labelsIdx struct {
 // minute for delays.
 const defaultIntervalForStartTimestamps = int64(300_000)
 
+// cachedResourceAttrs holds the pre-built slices for a unique resource.
+// Each TimeSeries gets its own *ResourceAttributes struct (with per-series
+// Timestamp) but shares these slices.
+//
+// SAFETY: ReuseTimeseries zeroes strings through the shared slices. This
+// is safe because all series in a request are marshaled into the gRPC
+// WriteRequest before ReuseSlice is called. If this lifecycle invariant
+// ever changes (e.g. incremental marshaling), each series must get its
+// own copy of the slices.
+type cachedResourceAttrs struct {
+	Identifying []mimirpb.AttributeEntry
+	Descriptive []mimirpb.AttributeEntry
+	Entities    []mimirpb.ResourceEntity
+}
+
+// cachedScopeAttrs holds the pre-built fields for a unique scope.
+// Each TimeSeries gets its own *ScopeAttributes struct (with per-series
+// Timestamp) but shares the Attrs slice.
+//
+// SAFETY: ReuseTimeseries zeroes strings through the shared Attrs slice.
+// This is safe because all series in a request are marshaled into the gRPC
+// WriteRequest before ReuseSlice is called. If this lifecycle invariant
+// ever changes (e.g. incremental marshaling), each series must get its
+// own copy of the slice.
+type cachedScopeAttrs struct {
+	Name      string
+	Version   string
+	SchemaURL string
+	Attrs     []mimirpb.AttributeEntry
+}
+
 type MimirAppender struct {
 	EnableCreatedTimestampZeroIngestion        bool
 	ValidIntervalCreatedTimestampZeroIngestion int64
@@ -44,15 +75,29 @@ type MimirAppender struct {
 	// This is needed to not send metadata duplicates all the time.
 	// We could get rid of this if we switched to RW2 all the way through.
 	metricFamilies map[string]metadata.Metadata
+
+	// resourceAttrCache and scopeAttrCache cache the expensive-to-build
+	// attribute slices for each unique OTel resource/scope. The pointer
+	// identity of *ResourceContext / *ScopeContext is stable within a
+	// single OTLP request's ResourceMetrics boundary.
+	//
+	// We cache the slices (not the full struct) because each TimeSeries
+	// needs its own *ResourceAttributes with a per-series Timestamp, and
+	// because ReuseTimeseries zeroes strings through the pointer — sharing
+	// the struct would corrupt all other series referencing it.
+	resourceAttrCache map[*storage.ResourceContext]cachedResourceAttrs
+	scopeAttrCache    map[*storage.ScopeContext]cachedScopeAttrs
 }
 
 func NewCombinedAppender() *MimirAppender {
 	return &MimirAppender{
 		ValidIntervalCreatedTimestampZeroIngestion: defaultIntervalForStartTimestamps,
-		series:         mimirpb.PreallocTimeseriesSliceFromPool(),
-		refs:           make(map[uint64]labelsIdx),
-		collisionRefs:  make(map[uint64][]labelsIdx),
-		metricFamilies: make(map[string]metadata.Metadata),
+		series:            mimirpb.PreallocTimeseriesSliceFromPool(),
+		refs:              make(map[uint64]labelsIdx),
+		collisionRefs:     make(map[uint64][]labelsIdx),
+		metricFamilies:    make(map[string]metadata.Metadata),
+		resourceAttrCache: make(map[*storage.ResourceContext]cachedResourceAttrs),
+		scopeAttrCache:    make(map[*storage.ScopeContext]cachedScopeAttrs),
 	}
 }
 
@@ -153,28 +198,49 @@ func (c *MimirAppender) createNewSeries(idx *labelsIdx, collisionIdx int, hash u
 	ts.Labels = mimirpb.FromLabelsToLabelAdapters(ls)
 	ts.CreatedTimestamp = ct
 
+	metricName := ls.Get(model.MetricNameLabel)
+
 	// Attach resource attributes if enabled and we have any.
 	// Skip target_info series since it's synthesized from resource attributes.
-	if c.PersistResourceAttributes && opts.Resource != nil && len(opts.Resource.Identifying) > 0 {
-		metricName := ls.Get(model.MetricNameLabel)
-		if metricName != "target_info" {
-			ts.ResourceAttributes = &mimirpb.ResourceAttributes{
+	if c.PersistResourceAttributes && metricName != "target_info" && opts.Resource != nil && len(opts.Resource.Identifying) > 0 {
+		cached, ok := c.resourceAttrCache[opts.Resource]
+		if !ok {
+			cached = cachedResourceAttrs{
 				Identifying: mapToAttributeEntries(opts.Resource.Identifying),
 				Descriptive: mapToAttributeEntries(opts.Resource.Descriptive),
 				Entities:    entityDataToResourceEntities(opts.Resource.Entities),
-				Timestamp:   t,
 			}
+			c.resourceAttrCache[opts.Resource] = cached
+		}
+		// Each TimeSeries gets its own struct with a per-series Timestamp.
+		// The slices are shared — see cachedResourceAttrs comment for safety.
+		ts.ResourceAttributes = &mimirpb.ResourceAttributes{
+			Identifying: cached.Identifying,
+			Descriptive: cached.Descriptive,
+			Entities:    cached.Entities,
+			Timestamp:   t,
 		}
 	}
 
 	// Attach scope attributes if enabled and we have any.
-	if c.PersistResourceAttributes && opts.Scope != nil {
+	// Skip target_info series since it's synthesized from resource attributes.
+	if c.PersistResourceAttributes && metricName != "target_info" && opts.Scope != nil {
 		if opts.Scope.Name != "" || opts.Scope.Version != "" || opts.Scope.SchemaURL != "" || len(opts.Scope.Attrs) > 0 {
+			cached, ok := c.scopeAttrCache[opts.Scope]
+			if !ok {
+				cached = cachedScopeAttrs{
+					Name:      opts.Scope.Name,
+					Version:   opts.Scope.Version,
+					SchemaURL: opts.Scope.SchemaURL,
+					Attrs:     mapToAttributeEntries(opts.Scope.Attrs),
+				}
+				c.scopeAttrCache[opts.Scope] = cached
+			}
 			ts.ScopeAttributes = &mimirpb.ScopeAttributes{
-				Name:      opts.Scope.Name,
-				Version:   opts.Scope.Version,
-				SchemaURL: opts.Scope.SchemaURL,
-				Attrs:     mapToAttributeEntries(opts.Scope.Attrs),
+				Name:      cached.Name,
+				Version:   cached.Version,
+				SchemaURL: cached.SchemaURL,
+				Attrs:     cached.Attrs,
 				Timestamp: t,
 			}
 		}
