@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/alecthomas/kingpin/v2"
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"go.uber.org/atomic"
+
+	"github.com/grafana/mimir/pkg/mimirpb"
+	"github.com/grafana/mimir/pkg/storage/ingest"
+)
+
+type DumpCommand struct {
+	topic             string
+	partition         int
+	skipFirst         int
+	exportOffsetStart int64
+	exportMaxRecords  int
+	inOutFile         *os.File
+	getKafkaClient    func() *kgo.Client
+	printer           Printer
+	printFormat       string
+}
+
+// Register is used to register the command to a parent command.
+func (c *DumpCommand) Register(app *kingpin.Application, getKafkaClient func() *kgo.Client, printer Printer) {
+	c.getKafkaClient = getKafkaClient
+	c.printer = printer
+
+	cmd := app.Command("dump", "Dump Kafka topic contents")
+	cmd.Flag("skip-first", "Skip until input record with offset N").Default("0").IntVar(&c.skipFirst)
+	cmd.Flag("file", "File to read from or write to.").Required().OpenFileVar(&c.inOutFile, os.O_RDWR|os.O_CREATE, 0600)
+
+	importCmd := cmd.Command("import", "Import records from a file into a Kafka topic").Action(c.doImport)
+	importCmd.Flag("topic", "Kafka topic to import into.").Required().StringVar(&c.topic)
+	importCmd.Flag("partition", "Kafka partition to import into").Required().IntVar(&c.partition)
+
+	exportCmd := cmd.Command("export", "Export records from a Kafka topic into a file").Action(c.doExport)
+	exportCmd.Flag("topic", "Kafka topic to dump.").Required().StringVar(&c.topic)
+	exportCmd.Flag("partition", "Kafka partition to dump.").Required().IntVar(&c.partition)
+	exportCmd.Flag("offset", "Offset to start exporting from. Set it to -2 to start consuming from the end of the partition.").Default("0").Int64Var(&c.exportOffsetStart)
+	exportCmd.Flag("export-max-records", "Maximum number of records to export.").Default("1000000").IntVar(&c.exportMaxRecords)
+
+	printCmd := cmd.Command("print", "Print the write requests inside records dumped using this tool").Action(c.doPrint)
+	printCmd.Flag("format", "Output format").Default("pretty").EnumVar(&c.printFormat, "pretty", "json")
+
+	cmd.Command("analyse", "Analyse dump file and compute statistics").Action(c.doAnalyse)
+}
+
+type key int
+
+const (
+	originalOffsetKey key = iota
+)
+
+func (c *DumpCommand) doExport(*kingpin.ParseContext) error {
+	var (
+		recordCount    = &atomic.Int64{}
+		consumedOffset = &atomic.Int64{}
+	)
+
+	client := c.getKafkaClient()
+	client.AddConsumePartitions(map[string]map[int32]kgo.Offset{
+		c.topic: {int32(c.partition): kgo.NewOffset().At(c.exportOffsetStart)}},
+	)
+
+	// Print the number of consumed records both when the export is in progress and at the end.
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			c.printer.PrintLine(fmt.Sprintf("consumed records: %d, offset %d", recordCount.Load(), consumedOffset.Load()))
+		}
+	}()
+	defer func() {
+		c.printer.PrintLine(fmt.Sprintf("consumed records: %d, offset %d", recordCount.Load(), consumedOffset.Load()))
+	}()
+
+	encoder := json.NewEncoder(c.inOutFile)
+
+	lastAvailableOffset := int64(-1)
+	for recordCount.Load() < int64(c.exportMaxRecords) {
+		fetches := client.PollFetches(context.Background())
+		if err := fetches.Err(); err != nil {
+			return fmt.Errorf("failed to fetch records: %w", err)
+		}
+		fetches.EachPartition(func(partition kgo.FetchTopicPartition) {
+			lastAvailableOffset = max(lastAvailableOffset, partition.HighWatermark-1)
+		})
+		var err error
+		fetches.EachRecord(func(record *kgo.Record) {
+			if recordCount.Inc() > int64(c.exportMaxRecords) {
+				return
+			}
+			consumedOffset.Store(record.Offset)
+			encodeErr := encoder.Encode(record)
+			if encodeErr != nil {
+				err = fmt.Errorf("encoding offset %d: %v", record.Offset, encodeErr)
+			}
+		})
+		if err != nil {
+			return err
+		}
+		if lastAvailableOffset >= 0 && consumedOffset.Load() >= lastAvailableOffset {
+			c.printer.PrintLine("reached high watermark before max records")
+			break
+		}
+	}
+	return nil
+}
+
+func (c *DumpCommand) doImport(*kingpin.ParseContext) error {
+	var (
+		recordCount          = &atomic.Int64{}
+		recordsTooLarge      = &atomic.Int64{}
+		corruptedJSONRecords = &atomic.Int64{}
+	)
+
+	client := c.getKafkaClient()
+
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			c.printer.PrintLine(fmt.Sprintf(
+				"produced items: %d, of those skipped because too large: %d, buffered records: %d, buffered bytes: %d",
+				recordCount.Load(), recordsTooLarge.Load(), client.BufferedProduceRecords(), client.BufferedProduceBytes()),
+			)
+		}
+	}()
+
+	produceErr := atomic.NewError(nil)
+
+	parseErr := c.parseRecordsFromDumpFile(
+		func(_ int, record *kgo.Record) {
+			client.Produce(context.Background(), record, func(record *kgo.Record, err error) {
+				recordCount.Inc()
+				if errors.Is(err, kerr.MessageTooLarge) {
+					recordsTooLarge.Inc()
+					return
+				}
+				if err != nil {
+					produceErr.Store(fmt.Errorf("failed to produce record with offset %d: %v", record.Context.Value(originalOffsetKey), err))
+				}
+			})
+		},
+		func(recordIdx int, err error) {
+			corruptedJSONRecords.Inc()
+			c.printer.PrintLine(fmt.Sprintf("corrupted JSON record %d: %v", recordIdx, err))
+		})
+
+	c.printer.PrintLine("waiting for produce to finish")
+	err := client.Flush(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to flush records: %w", err)
+	}
+
+	if parseErr != nil {
+		return fmt.Errorf("failed to parse dump file: %w", parseErr)
+	}
+	if err = produceErr.Load(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *DumpCommand) doPrint(*kingpin.ParseContext) error {
+	return c.parseWriteRequestsFromDumpFile(
+		func(recordIdx int, record *kgo.Record, req *mimirpb.WriteRequest) {
+			switch c.printFormat {
+			case "json":
+				// Print the entire write request as json.
+				lineBytes, err := json.Marshal(req)
+				if err != nil {
+					c.printer.PrintLine(fmt.Sprintf("failed to marshal write request: %v", err))
+					return
+				}
+				c.printer.PrintLine(string(lineBytes))
+			case "pretty":
+				// Print the time series in the write request.
+				c.printer.PrintLine(fmt.Sprintf("Record #%d (offset: %d)", recordIdx, record.Offset))
+				for _, series := range req.Timeseries {
+					for _, sample := range series.Samples {
+						c.printer.PrintLine(fmt.Sprintf("%s %d %f",
+							mimirpb.FromLabelAdaptersToLabels(series.Labels).String(),
+							sample.TimestampMs,
+							sample.Value,
+						))
+					}
+				}
+				c.printer.PrintLine("")
+			default:
+				c.printer.PrintLine(fmt.Sprintf("Invalid print format: %q", c.printFormat))
+				return
+			}
+		},
+		func(recordIdx int, err error) {
+			c.printer.PrintLine(fmt.Sprintf("corrupted record %d: %v", recordIdx, err))
+		},
+	)
+}
+
+func (c *DumpCommand) parseRecordsFromDumpFile(onRecordParsed func(recordIdx int, record *kgo.Record), onRecordCorrupted func(recordIdx int, err error)) error {
+	separator := bufio.NewScanner(c.inOutFile)
+	separator.Buffer(make([]byte, 10_000_000), 10_000_000) // 10MB buffer because we can have large records
+
+	for recordIdx := 0; separator.Scan(); recordIdx++ {
+		item := separator.Bytes()
+		record := &kgo.Record{}
+		err := json.Unmarshal(item, record)
+		if err != nil {
+			onRecordCorrupted(recordIdx, err)
+			continue
+		}
+		if record.Offset < int64(c.skipFirst) {
+			continue
+		}
+		record.Topic = c.topic
+		record.Partition = int32(c.partition)
+		record.Context = context.WithValue(context.Background(), originalOffsetKey, record.Offset)
+
+		onRecordParsed(recordIdx, record)
+	}
+
+	if separator.Err() != nil {
+		return fmt.Errorf("separator scan failed: %w", separator.Err())
+	}
+
+	return nil
+}
+
+// parseWriteRequestsFromDumpFile parses all records from the dump file and deserializes each WriteRequest.
+// It calls onRequestParsed for each successfully parsed request, and onCorrupted when either the JSON
+// record is malformed or the WriteRequest cannot be deserialized.
+func (c *DumpCommand) parseWriteRequestsFromDumpFile(
+	onParsed func(recordIdx int, record *kgo.Record, req *mimirpb.WriteRequest),
+	onCorrupted func(recordIdx int, err error),
+) error {
+	return c.parseRecordsFromDumpFile(
+		func(recordIdx int, record *kgo.Record) {
+			req := mimirpb.PreallocWriteRequest{}
+			defer mimirpb.ReuseSlice(req.Timeseries)
+
+			version := ingest.ParseRecordVersion(record)
+			if err := ingest.DeserializeRecordContent(record.Value, &req, version); err != nil {
+				onCorrupted(recordIdx, fmt.Errorf("failed to deserialize write request: %w", err))
+				return
+			}
+
+			onParsed(recordIdx, record, &req.WriteRequest)
+		},
+		onCorrupted,
+	)
+}

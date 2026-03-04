@@ -1,0 +1,619 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Provenance-includes-location: https://github.com/cortexproject/cortex/blob/master/pkg/alertmanager/api.go
+// Provenance-includes-license: Apache-2.0
+// Provenance-includes-copyright: The Cortex Authors.
+
+package alertmanager
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"reflect"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/concurrency"
+	"github.com/grafana/dskit/tenant"
+	"github.com/prometheus/alertmanager/config"
+	"github.com/prometheus/alertmanager/template"
+	commoncfg "github.com/prometheus/common/config"
+	"go.yaml.in/yaml/v3"
+
+	"github.com/grafana/mimir/pkg/alertmanager/alertspb"
+	"github.com/grafana/mimir/pkg/util"
+	util_log "github.com/grafana/mimir/pkg/util/log"
+)
+
+const (
+	errMarshallingYAML       = "error marshalling YAML Alertmanager config"
+	errValidatingConfig      = "error validating Alertmanager config"
+	errReadingConfiguration  = "unable to read the Alertmanager config"
+	errStoringConfiguration  = "unable to store the Alertmanager config"
+	errDeletingConfiguration = "unable to delete the Alertmanager config"
+	errNoOrgID               = "unable to determine the OrgID"
+	errListAllUser           = "unable to list the Alertmanager users"
+	errConfigurationTooBig   = "Alertmanager configuration is too big, limit: %d bytes"
+	errTooManyTemplates      = "too many templates in the configuration: %d (limit: %d)"
+	errTemplateTooBig        = "template %s is too big: %d bytes (limit: %d bytes)"
+
+	fetchConcurrency = 16
+)
+
+var (
+	errPasswordFileNotAllowed            = errors.New("setting smtp_auth_password_file, password_file, bearer_token_file, auth_password_file or credentials_file is not allowed")
+	errOAuth2SecretFileNotAllowed        = errors.New("setting OAuth2 client_secret_file is not allowed")
+	errProxyURLNotAllowed                = errors.New("setting proxy_url is not allowed")
+	errProxyFromEnvironmentURLNotAllowed = errors.New("setting proxy_from_environment is not allowed")
+	errTLSConfigNotAllowed               = errors.New("setting TLS ca_file, cert_file, key_file, ca, cert or key is not allowed")
+	errSlackAPIURLFileNotAllowed         = errors.New("setting Slack api_url_file or global slack_api_url_file is not allowed")
+	errVictorOpsAPIKeyFileNotAllowed     = errors.New("setting VictorOps api_key_file or global victorops_api_key_file is not allowed")
+	errOpsGenieAPIKeyFileFileNotAllowed  = errors.New("setting OpsGenie api_key_file or global opsgenie_api_key_file is not allowed")
+	errPagerDutyServiceKeyFileNotAllowed = errors.New("setting PagerDuty service_key_file is not allowed")
+	errPagerDutyRoutingKeyFileNotAllowed = errors.New("setting PagerDuty routing_key_file is not allowed")
+	errPushoverUserKeyFileNotAllowed     = errors.New("setting Pushover user_key_file is not allowed")
+	errPushoverTokenFileNotAllowed       = errors.New("setting Pushover token_file is not allowed")
+	errTelegramBotTokenFileNotAllowed    = errors.New("setting Telegram bot_token_file is not allowed")
+	errWebhookURLFileNotAllowed          = errors.New("setting Webhook url_file is not allowed")
+)
+
+// UserConfig is used to communicate a users alertmanager configs
+type UserConfig struct {
+	TemplateFiles      map[string]string `yaml:"template_files"`
+	AlertmanagerConfig string            `yaml:"alertmanager_config"`
+}
+
+func (am *MultitenantAlertmanager) GetUserConfig(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), am.logger)
+
+	userID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+
+	cfg, err := am.store.GetAlertConfig(r.Context(), userID)
+	if err != nil {
+		if errors.Is(err, alertspb.ErrNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	d, err := yaml.Marshal(&UserConfig{
+		TemplateFiles:      alertspb.ParseTemplates(cfg),
+		AlertmanagerConfig: cfg.RawConfig,
+	})
+
+	if err != nil {
+		level.Error(logger).Log("msg", errMarshallingYAML, "err", err, "user", userID)
+		http.Error(w, fmt.Sprintf("%s: %s", errMarshallingYAML, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/yaml")
+	if _, err := w.Write(d); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func (am *MultitenantAlertmanager) SetUserConfig(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), am.logger)
+	userID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+
+	var input io.Reader
+	maxConfigSize := am.limits.AlertmanagerMaxConfigSize(userID)
+	if maxConfigSize > 0 {
+		// LimitReader will return EOF after reading specified number of bytes. To check if
+		// we have read too many bytes, allow one extra byte.
+		input = io.LimitReader(r.Body, int64(maxConfigSize)+1)
+	} else {
+		input = r.Body
+	}
+
+	payload, err := io.ReadAll(input)
+	if err != nil {
+		level.Error(logger).Log("msg", errReadingConfiguration, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errReadingConfiguration, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	if maxConfigSize > 0 && len(payload) > maxConfigSize {
+		msg := fmt.Sprintf(errConfigurationTooBig, maxConfigSize)
+		level.Warn(logger).Log("msg", msg)
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
+
+	cfg := &UserConfig{}
+	err = yaml.Unmarshal(payload, cfg)
+	if err != nil {
+		level.Error(logger).Log("msg", errMarshallingYAML, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errMarshallingYAML, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	cfgDesc := alertspb.ToProto(cfg.AlertmanagerConfig, cfg.TemplateFiles, userID)
+	if err := validateUserConfig(logger, cfgDesc, am.limits, userID, am.cfg.UTF8MigrationLogging); err != nil {
+		level.Warn(logger).Log("msg", errValidatingConfig, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errValidatingConfig, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	err = am.store.SetAlertConfig(r.Context(), cfgDesc)
+	if err != nil {
+		level.Error(logger).Log("msg", errStoringConfiguration, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errStoringConfiguration, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+}
+
+// DeleteUserConfig is exposed via user-visible API (if enabled, uses DELETE method), but also as an internal endpoint using POST method.
+// Note that if no config exists for a user, StatusOK is returned.
+func (am *MultitenantAlertmanager) DeleteUserConfig(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), am.logger)
+	userID, err := tenant.TenantID(r.Context())
+	if err != nil {
+		level.Error(logger).Log("msg", errNoOrgID, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errNoOrgID, err.Error()), http.StatusUnauthorized)
+		return
+	}
+
+	err = am.store.DeleteAlertConfig(r.Context(), userID)
+	if err != nil {
+		level.Error(logger).Log("msg", errDeletingConfiguration, "err", err.Error())
+		http.Error(w, fmt.Sprintf("%s: %s", errDeletingConfiguration, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// Partially copied from: https://github.com/prometheus/alertmanager/blob/8e861c646bf67599a1704fc843c6a94d519ce312/cli/check_config.go#L65-L96
+func validateUserConfig(logger log.Logger, cfg alertspb.AlertConfigDesc, limits Limits, user string, utf8MigrationLogging bool) error {
+	if utf8MigrationLogging {
+		validateMatchersInConfigDesc(logger, "api", cfg)
+	}
+
+	// We don't have a valid use case for empty configurations. If a tenant does not have a
+	// configuration set and issue a request to the Alertmanager, we'll a) upload an empty
+	// config and b) immediately start an Alertmanager instance for them if a fallback
+	// configuration is provisioned.
+	if cfg.RawConfig == "" {
+		return fmt.Errorf("configuration provided is empty, if you'd like to remove your configuration please use the delete configuration endpoint")
+	}
+
+	amCfg, err := config.Load(cfg.RawConfig)
+	if err != nil {
+		return err
+	}
+
+	// Validate the config recursively scanning it.
+	if err := validateAlertmanagerConfig(amCfg); err != nil {
+		return err
+	}
+
+	// Validate templates referenced in the alertmanager config.
+	for _, name := range amCfg.Templates {
+		if err := validateTemplateFilename(name); err != nil {
+			return err
+		}
+	}
+
+	// Check template limits.
+	if l := limits.AlertmanagerMaxTemplatesCount(user); l > 0 && len(cfg.Templates) > l {
+		return fmt.Errorf(errTooManyTemplates, len(cfg.Templates), l)
+	}
+
+	if maxSize := limits.AlertmanagerMaxTemplateSize(user); maxSize > 0 {
+		for _, tmpl := range cfg.Templates {
+			if size := len(tmpl.GetBody()); size > maxSize {
+				return fmt.Errorf(errTemplateTooBig, tmpl.GetFilename(), size, maxSize)
+			}
+		}
+	}
+
+	// Validate template files.
+	for _, tmpl := range cfg.Templates {
+		if err := validateTemplateFilename(tmpl.Filename); err != nil {
+			return err
+		}
+	}
+
+	// Create templates on disk in a temporary directory.
+	// Note: This means the validation will succeed if we can write to tmp but
+	// not to configured data dir, and on the flipside, it'll fail if we can't write
+	// to tmpDir. Ignoring both cases for now as they're ultra rare but will revisit if
+	// we see this in the wild.
+	userTempDir, err := os.MkdirTemp("", "validate-config-"+cfg.User)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(userTempDir)
+
+	templateFiles := make([]string, 0, len(cfg.Templates))
+	for _, tmpl := range cfg.Templates {
+		templateFilepath, err := safeTemplateFilepath(userTempDir, tmpl.Filename)
+		if err != nil {
+			level.Error(logger).Log("msg", "unable to create template file path", "err", err, "user", cfg.User)
+			return err
+		}
+
+		if _, err = storeTemplateFile(templateFilepath, tmpl.Body); err != nil {
+			level.Error(logger).Log("msg", "unable to store template file", "err", err, "user", cfg.User)
+			return fmt.Errorf("unable to store template file '%s'", tmpl.Filename)
+		}
+
+		templateFiles = append(templateFiles, templateFilepath)
+	}
+
+	_, err = template.FromGlobs(templateFiles, WithCustomFunctions(user))
+	if err != nil {
+		return err
+	}
+
+	// Note: Not validating the MultitenantAlertmanager.transformConfig function as that
+	// that function shouldn't break configuration. Only way it can fail is if the base
+	// autoWebhookURL itself is broken. In that case, I would argue, we should accept the config
+	// not reject it.
+
+	return nil
+}
+
+func (am *MultitenantAlertmanager) ListAllConfigs(w http.ResponseWriter, r *http.Request) {
+	logger := util_log.WithContext(r.Context(), am.logger)
+	userIDs, err := am.store.ListAllUsers(r.Context())
+	if err != nil {
+		level.Error(logger).Log("msg", "failed to list users of alertmanager", "err", err)
+		http.Error(w, fmt.Sprintf("%s: %s", errListAllUser, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	done := make(chan struct{})
+	iter := make(chan interface{})
+
+	go func() {
+		util.StreamWriteYAMLResponse(w, iter, logger)
+		close(done)
+	}()
+
+	err = concurrency.ForEachUser(r.Context(), userIDs, fetchConcurrency, func(ctx context.Context, userID string) error {
+		cfg, err := am.store.GetAlertConfig(ctx, userID)
+		if errors.Is(err, alertspb.ErrNotFound) {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("failed to fetch alertmanager config for user %s: %w", userID, err)
+		}
+		data := map[string]*UserConfig{
+			userID: {
+				TemplateFiles:      alertspb.ParseTemplates(cfg),
+				AlertmanagerConfig: cfg.RawConfig,
+			},
+		}
+
+		select {
+		case iter <- data:
+		case <-done: // stop early, if sending response has already finished
+		}
+
+		return nil
+	})
+	if err != nil {
+		level.Error(logger).Log("msg", "failed to list all alertmanager configs", "err", err)
+	}
+	close(iter)
+	<-done
+}
+
+// validateAlertmanagerConfig recursively scans the input config looking for data types for which
+// we have a specific validation and, whenever encountered, it runs their validation. Returns the
+// first error or nil if validation succeeds.
+func validateAlertmanagerConfig(cfg interface{}) error {
+	v := reflect.ValueOf(cfg)
+	t := v.Type()
+
+	// Skip invalid, the zero value or a nil pointer (checked by zero value).
+	if !v.IsValid() || v.IsZero() {
+		return nil
+	}
+
+	// If the input config is a pointer then we need to get its value.
+	// At this point the pointer value can't be nil.
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+		t = v.Type()
+	}
+
+	// Check if the input config is a data type for which we have a specific validation.
+	// At this point the value can't be a pointer anymore.
+	switch t {
+	case reflect.TypeOf(config.GlobalConfig{}):
+		if err := validateGlobalConfig(v.Interface().(config.GlobalConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.DiscordConfig{}):
+		if err := validateDiscordConfig(v.Interface().(config.DiscordConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.EmailConfig{}):
+		if err := validateEmailConfig(v.Interface().(config.EmailConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(commoncfg.HTTPClientConfig{}):
+		if err := validateReceiverHTTPConfig(v.Interface().(commoncfg.HTTPClientConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(commoncfg.TLSConfig{}):
+		if err := validateReceiverTLSConfig(v.Interface().(commoncfg.TLSConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.SlackConfig{}):
+		if err := validateSlackConfig(v.Interface().(config.SlackConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.OpsGenieConfig{}):
+		if err := validateOpsGenieConfig(v.Interface().(config.OpsGenieConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.VictorOpsConfig{}):
+		if err := validateVictorOpsConfig(v.Interface().(config.VictorOpsConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.PagerdutyConfig{}):
+		if err := validatePagerDutyConfig(v.Interface().(config.PagerdutyConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.PushoverConfig{}):
+		if err := validatePushoverConfig(v.Interface().(config.PushoverConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.MSTeamsConfig{}):
+		if err := validateMSTeamsConfig(v.Interface().(config.MSTeamsConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.MSTeamsV2Config{}):
+		if err := validateMSTeamsV2Config(v.Interface().(config.MSTeamsV2Config)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.TelegramConfig{}):
+		if err := validateTelegramConfig(v.Interface().(config.TelegramConfig)); err != nil {
+			return err
+		}
+
+	case reflect.TypeOf(config.WebhookConfig{}):
+		if err := validateWebhookConfig(v.Interface().(config.WebhookConfig)); err != nil {
+			return err
+		}
+	}
+
+	// If the input config is a struct, recursively iterate on all fields.
+	if t.Kind() == reflect.Struct {
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			fieldValue := v.FieldByIndex(field.Index)
+
+			// Skip any field value which can't be converted to interface (eg. primitive types).
+			if fieldValue.CanInterface() {
+				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
+		for i := 0; i < v.Len(); i++ {
+			fieldValue := v.Index(i)
+
+			// Skip any field value which can't be converted to interface (eg. primitive types).
+			if fieldValue.CanInterface() {
+				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if t.Kind() == reflect.Map {
+		for _, key := range v.MapKeys() {
+			fieldValue := v.MapIndex(key)
+
+			// Skip any field value which can't be converted to interface (eg. primitive types).
+			if fieldValue.CanInterface() {
+				if err := validateAlertmanagerConfig(fieldValue.Interface()); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateReceiverHTTPConfig validates the HTTP config and returns an error if it contains
+// settings not allowed by Mimir.
+func validateReceiverHTTPConfig(cfg commoncfg.HTTPClientConfig) error {
+	if cfg.BasicAuth != nil && cfg.BasicAuth.PasswordFile != "" {
+		return errPasswordFileNotAllowed
+	}
+	if cfg.Authorization != nil && cfg.Authorization.CredentialsFile != "" {
+		return errPasswordFileNotAllowed
+	}
+	if cfg.BearerTokenFile != "" {
+		return errPasswordFileNotAllowed
+	}
+	if cfg.OAuth2 != nil {
+		if cfg.OAuth2.ClientSecretFile != "" {
+			return errOAuth2SecretFileNotAllowed
+		}
+		// Mimir's "firewall" doesn't protect OAuth2 client, so we disallow Proxy settings here.
+		if cfg.OAuth2.ProxyURL.URL != nil {
+			return errProxyURLNotAllowed
+		}
+		if cfg.OAuth2.ProxyFromEnvironment {
+			return errProxyFromEnvironmentURLNotAllowed
+		}
+	}
+	// We allow setting proxy config (cfg.ProxyConfig), because Mimir's "firewall" protects those calls.
+	return validateReceiverTLSConfig(cfg.TLSConfig)
+}
+
+// validateReceiverTLSConfig validates the TLS config and returns an error if it contains
+// settings not allowed by Mimir.
+func validateReceiverTLSConfig(cfg commoncfg.TLSConfig) error {
+	if cfg.CAFile != "" || cfg.CertFile != "" || cfg.KeyFile != "" || cfg.CA != "" || cfg.Cert != "" || cfg.Key != "" {
+		return errTLSConfigNotAllowed
+	}
+	return nil
+}
+
+// validateGlobalConfig validates the Global config and returns an error if it contains
+// settings not allowed by Mimir.
+func validateGlobalConfig(cfg config.GlobalConfig) error {
+	if cfg.SlackAPIURLFile != "" {
+		return errSlackAPIURLFileNotAllowed
+	}
+	if cfg.OpsGenieAPIKeyFile != "" {
+		return errOpsGenieAPIKeyFileFileNotAllowed
+	}
+	if cfg.SMTPAuthPasswordFile != "" {
+		return errPasswordFileNotAllowed
+	}
+	if cfg.VictorOpsAPIKeyFile != "" {
+		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateDiscordConfig validates the Discord config and returns an error if it
+// contains settings not allowed by Mimir.
+func validateDiscordConfig(cfg config.DiscordConfig) error {
+	if cfg.WebhookURLFile != "" {
+		return errWebhookURLFileNotAllowed
+	}
+	return nil
+}
+
+// validateEmailConfig validates the Email config and returns an error if it contains settings not allowed by Mimir.
+func validateEmailConfig(cfg config.EmailConfig) error {
+	if cfg.AuthPasswordFile != "" {
+		return errPasswordFileNotAllowed
+	}
+
+	return nil
+}
+
+// validateSlackConfig validates the Slack config and returns an error if it contains
+// settings not allowed by Mimir.
+func validateSlackConfig(cfg config.SlackConfig) error {
+	if cfg.APIURLFile != "" {
+		return errSlackAPIURLFileNotAllowed
+	}
+	return nil
+}
+
+// validateVictorOpsConfig validates the VictorOps config and returns an error if it contains
+// settings not allowed by Mimir.
+func validateVictorOpsConfig(cfg config.VictorOpsConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errVictorOpsAPIKeyFileNotAllowed
+	}
+	return nil
+}
+
+// validateOpsGenieConfig validates the OpsGenie config and returns an error if it contains
+// settings not allowed by Mimir.
+func validateOpsGenieConfig(cfg config.OpsGenieConfig) error {
+	if cfg.APIKeyFile != "" {
+		return errOpsGenieAPIKeyFileFileNotAllowed
+	}
+	return nil
+}
+
+// validatePagerDutyConfig validates the PagerDuty config and returns an error if it contains
+// settings not allowed by Mimir.
+func validatePagerDutyConfig(cfg config.PagerdutyConfig) error {
+	if cfg.ServiceKeyFile != "" {
+		return errPagerDutyServiceKeyFileNotAllowed
+	}
+	if cfg.RoutingKeyFile != "" {
+		return errPagerDutyRoutingKeyFileNotAllowed
+	}
+
+	return nil
+}
+
+// validatePushoverConfig validates the Pushover config and returns an error if it contains
+// settings not allowed by Mimir.
+func validatePushoverConfig(cfg config.PushoverConfig) error {
+	if cfg.UserKeyFile != "" {
+		return errPushoverUserKeyFileNotAllowed
+	}
+	if cfg.TokenFile != "" {
+		return errPushoverTokenFileNotAllowed
+	}
+
+	return nil
+}
+
+// validateMSTeamsConfig validates the Microsoft Teams config and returns an error if it
+// contains settings not allowed by Mimir.
+func validateMSTeamsConfig(cfg config.MSTeamsConfig) error {
+	if cfg.WebhookURLFile != "" {
+		return errWebhookURLFileNotAllowed
+	}
+	return nil
+}
+
+// validateMSTeamsV2Config validates the Microsoft Teams config and returns an error if it
+// contains settings not allowed by Mimir.
+func validateMSTeamsV2Config(cfg config.MSTeamsV2Config) error {
+	if cfg.WebhookURLFile != "" {
+		return errWebhookURLFileNotAllowed
+	}
+	return nil
+}
+
+// validateTelegramConfig validates the Telegram config and returns an error if it contains
+// settings not allowed by Mimir.
+func validateTelegramConfig(cfg config.TelegramConfig) error {
+	if cfg.BotTokenFile != "" {
+		return errTelegramBotTokenFileNotAllowed
+	}
+	return nil
+}
+
+// validateWebhookConfig validates the Webhook config and returns an error if it contains
+// settings not allowed by Mimir.
+func validateWebhookConfig(cfg config.WebhookConfig) error {
+	if cfg.URLFile != "" {
+		return errWebhookURLFileNotAllowed
+	}
+	return nil
+}

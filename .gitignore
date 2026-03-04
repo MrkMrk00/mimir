@@ -1,0 +1,48 @@
+cmd/mimirtool/mimirtool
+cmd/mimirtool/mimirtool_linux_amd64
+cmd/mimirtool/mimirtool_linux_arm64
+cmd/test-exporter/test-exporter
+cmd/mimir/mimir
+cmd/mimir/mimir_linux_amd64
+cmd/mimir/mimir_linux_arm64
+cmd/query-tee/query-tee
+cmd/query-tee/query-tee_linux_amd64
+cmd/query-tee/query-tee_linux_arm64
+cmd/metaconvert/metaconvert
+cmd/metaconvert/metaconvert_linux_amd64
+cmd/metaconvert/metaconvert_linux_arm64
+tools/config-inspector/config-inspector
+tools/kafkatool/kafkatool
+.bak
+.uptodate
+.pkg
+.cache
+.swp
+docker-images/
+e2e_integration_test*
+active-query-tracker
+dist/
+jsonnet-example/
+jsonnet-tests/
+metrics-activity.log
+
+# Binaries built from ./cmd
+/mimir
+/mimirtool
+/query-tee
+/test-exporter
+
+# This is custom Makefile modification, if it exists.
+Makefile.local
+
+.idea
+.vscode
+compose
+compose-simple
+.DS_Store
+coverage.txt
+# Go Telemetry
+.config/go/telemetry/
+
+# AI agent configuration files
+AGENTS.md

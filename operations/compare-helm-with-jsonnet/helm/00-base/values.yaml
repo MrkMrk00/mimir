@@ -1,0 +1,52 @@
+chunks-cache:
+    enabled: true
+index-cache:
+    enabled: true
+metadata-cache:
+    enabled: true
+results-cache:
+    enabled: true
+minio:
+    enabled: false
+kafka:
+    enabled: false
+rbac:
+    create: false
+    pspEnabled: false
+serviceAccount:
+    create: false
+
+# These overrides are for the Helm chart changes https://github.com/grafana/mimir/issues/11886
+# The Jsonnet bundle doesn't provide any gateway or ingress.
+gateway:
+    enabled: false
+
+# To be updated in https://github.com/grafana/mimir/issues/2922
+rollout_operator:
+  enabled: false
+ingester:
+  zoneAwareReplication:
+    enabled: false
+  resources:
+    requests:
+      # request the same as jsonnet, so that the derived GOMAXPROCS are the same
+      cpu: 4
+      memory: 15Gi
+store_gateway:
+  zoneAwareReplication:
+    enabled: false
+
+# These overrides are for the Helm chart changes https://github.com/grafana/mimir/issues/12177
+# To be removed after we update the Jsonnet bundle to use the ingest storage by default.
+mimir:
+  structuredConfig:
+    ingest_storage:
+      enabled: false
+      kafka:
+        address: null
+        topic: null
+        auto_create_topic_default_partitions: null
+    distributor:
+      remote_timeout: null
+    ingester:
+      push_grpc_method_enabled: null

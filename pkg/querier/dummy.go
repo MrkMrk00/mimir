@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Provenance-includes-location: https://github.com/cortexproject/cortex/blob/master/pkg/querier/dummy.go
+// Provenance-includes-license: Apache-2.0
+// Provenance-includes-copyright: The Cortex Authors.
+
+package querier
+
+import (
+	"net/url"
+
+	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/rules"
+	"github.com/prometheus/prometheus/scrape"
+)
+
+// DummyTargetRetriever implements github.com/prometheus/prometheus/web/api/v1.TargetRetriever.
+// and v1.ScrapePoolsRetriever
+type DummyTargetRetriever struct{}
+
+// TargetsActive implements TargetRetriever.
+func (DummyTargetRetriever) TargetsActive() map[string][]*scrape.Target {
+	return map[string][]*scrape.Target{}
+}
+
+// TargetsDropped implements TargetRetriever.
+func (DummyTargetRetriever) TargetsDropped() map[string][]*scrape.Target {
+	return map[string][]*scrape.Target{}
+}
+
+// TargetsDroppedCounts implements TargetRetriever.
+func (DummyTargetRetriever) TargetsDroppedCounts() map[string]int {
+	return map[string]int{}
+}
+
+// ScrapePoolConfig implements TargetRetriever.
+func (DummyTargetRetriever) ScrapePoolConfig(string) (*config.ScrapeConfig, error) {
+	return nil, nil
+}
+
+func (DummyTargetRetriever) ScrapePools() []string { return nil }
+
+// DummyAlertmanagerRetriever implements AlertmanagerRetriever.
+type DummyAlertmanagerRetriever struct{}
+
+// Alertmanagers implements AlertmanagerRetriever.
+func (DummyAlertmanagerRetriever) Alertmanagers() []*url.URL { return nil }
+
+// DroppedAlertmanagers implements AlertmanagerRetriever.
+func (DummyAlertmanagerRetriever) DroppedAlertmanagers() []*url.URL { return nil }
+
+// DummyRulesRetriever implements RulesRetriever.
+type DummyRulesRetriever struct{}
+
+// RuleGroups implements RulesRetriever.
+func (DummyRulesRetriever) RuleGroups() []*rules.Group {
+	return nil
+}
+
+// AlertingRules implements RulesRetriever.
+func (DummyRulesRetriever) AlertingRules() []*rules.AlertingRule {
+	return nil
+}

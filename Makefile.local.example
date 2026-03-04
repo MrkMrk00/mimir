@@ -1,0 +1,7 @@
+# Example of extending Makefile with Makefile.local.
+
+BUILD_IMAGE ?= grafana/mimir-build-image
+IMAGE_PREFIX ?= custom-prefix/
+
+mimir-push: cmd/mimir/.uptodate
+	docker push $(IMAGE_PREFIX)mimir:$(IMAGE_TAG)

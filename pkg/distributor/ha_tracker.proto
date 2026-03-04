@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Provenance-includes-location: https://github.com/cortexproject/cortex/blob/master/pkg/distributor/ha_tracker.proto
+// Provenance-includes-license: Apache-2.0
+// Provenance-includes-copyright: The Cortex Authors.
+
+syntax = "proto3";
+
+package distributor;
+
+import "gogoproto/gogo.proto";
+
+option (gogoproto.marshaler_all) = true;
+option (gogoproto.unmarshaler_all) = true;
+
+message ReplicaDesc {
+  string replica = 1;
+
+  // Unix timestamp in milliseconds when we have last received request from this replica.
+  int64 received_at = 2;
+
+  // Unix timestamp in milliseconds when this entry was marked for deletion.
+  // Reason for doing marking first, and delete later, is to make sure that distributors
+  // watching the prefix will receive notification on "marking" -- at which point they can
+  // already remove entry from memory. Actual deletion from KV store does *not* trigger
+  // "watch" notification with a key for all KV stores.
+  int64 deleted_at = 3;
+  // This is the most recent timestamp when this replica was elected as the leader.
+  int64 elected_at = 4;
+  // This is incremented every time a new replica is elected as the leader.
+  int64 elected_changes = 5;
+}

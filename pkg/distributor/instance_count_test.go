@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package distributor
+
+import (
+	"testing"
+	"time"
+
+	"github.com/grafana/dskit/ring"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/atomic"
+)
+
+type nopDelegate struct{}
+
+func (n nopDelegate) OnRingInstanceRegister(_ *ring.BasicLifecycler, _ ring.Desc, _ bool, _ string, instanceDesc ring.InstanceDesc) (ring.InstanceState, ring.Tokens) {
+	return instanceDesc.State, instanceDesc.GetTokens()
+}
+
+func (n nopDelegate) OnRingInstanceTokens(*ring.BasicLifecycler, ring.Tokens) {
+}
+
+func (n nopDelegate) OnRingInstanceStopping(*ring.BasicLifecycler) {
+}
+
+func (n nopDelegate) OnRingInstanceHeartbeat(*ring.BasicLifecycler, *ring.Desc, *ring.InstanceDesc) {
+}
+
+func TestHealthyInstanceDelegate_OnRingInstanceHeartbeat(t *testing.T) {
+	// addInstance registers a new instance with the given ring and sets its last heartbeat timestamp
+	addInstance := func(desc *ring.Desc, id string, state ring.InstanceState, timestamp int64) {
+		instance := desc.AddIngester(id, "127.0.0.1", "", []uint32{1}, state, time.Now(), false, time.Time{}, nil)
+		instance.Timestamp = timestamp
+		desc.Ingesters[id] = instance
+	}
+
+	tests := map[string]struct {
+		ringSetup     func(desc *ring.Desc)
+		expectedCount uint32
+	}{
+		"all instances healthy and active": {
+			ringSetup: func(desc *ring.Desc) {
+				now := time.Now()
+				addInstance(desc, "distributor-1", ring.ACTIVE, now.Unix())
+				addInstance(desc, "distributor-2", ring.ACTIVE, now.Unix())
+				addInstance(desc, "distributor-3", ring.ACTIVE, now.Unix())
+			},
+			expectedCount: 3,
+		},
+
+		"all instances healthy not all instances active": {
+			ringSetup: func(desc *ring.Desc) {
+				now := time.Now()
+				addInstance(desc, "distributor-1", ring.ACTIVE, now.Unix())
+				addInstance(desc, "distributor-2", ring.LEAVING, now.Unix())
+				addInstance(desc, "distributor-3", ring.ACTIVE, now.Unix())
+			},
+			expectedCount: 2,
+		},
+
+		"some instances healthy all instances active": {
+			ringSetup: func(desc *ring.Desc) {
+				now := time.Now()
+				addInstance(desc, "distributor-1", ring.ACTIVE, now.Unix())
+				addInstance(desc, "distributor-2", ring.ACTIVE, now.Unix())
+				addInstance(desc, "distributor-3", ring.ACTIVE, now.Add(-5*time.Minute).Unix())
+			},
+			expectedCount: 2,
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			count := atomic.NewUint32(0)
+			ringDesc := ring.NewDesc()
+
+			testData.ringSetup(ringDesc)
+			instance := ringDesc.Ingesters["distributor-1"]
+
+			delegate := newHealthyInstanceDelegate(count, time.Minute, &nopDelegate{})
+			delegate.OnRingInstanceHeartbeat(&ring.BasicLifecycler{}, ringDesc, &instance)
+
+			assert.Equal(t, testData.expectedCount, count.Load())
+		})
+	}
+}

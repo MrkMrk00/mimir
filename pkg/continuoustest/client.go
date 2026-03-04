@@ -1,0 +1,383 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package continuoustest
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/middleware"
+	"github.com/prometheus/client_golang/api"
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/prompb"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	querierapi "github.com/grafana/mimir/pkg/querier/api"
+	"github.com/grafana/mimir/pkg/util/chunkinfologger"
+)
+
+const (
+	maxErrMsgLen     = 256
+	defaultTenant    = "anonymous"
+	defaultUserAgent = "mimir-continuous-test"
+)
+
+// MimirClient is the interface implemented by a client used to interact with Mimir.
+type MimirClient interface {
+	// WriteSeries writes input series to Mimir. Returns the response status code and optionally
+	// an error. The error is always returned if request was not successful (eg. received a 4xx or 5xx error).
+	WriteSeries(ctx context.Context, series []prompb.TimeSeries, metadata []prompb.MetricMetadata) (statusCode int, err error)
+
+	// QueryRange performs a range query.
+	QueryRange(ctx context.Context, query string, start, end time.Time, step time.Duration, options ...RequestOption) (model.Matrix, error)
+
+	// Query performs an instant query.
+	Query(ctx context.Context, query string, ts time.Time, options ...RequestOption) (model.Vector, error)
+
+	// Metadata performs a metadata query.
+	Metadata(ctx context.Context, metricName string) (v1.Metadata, error)
+
+	// Protocol indicates the protocol used to write series data.
+	Protocol() string
+}
+
+type ClientConfig struct {
+	TenantID          string
+	BasicAuthUser     string
+	BasicAuthPassword string
+	BearerToken       string
+
+	WriteBaseEndpoint flagext.URLValue
+	WriteBatchSize    int
+	WriteTimeout      time.Duration
+	WriteProtocol     string
+
+	ReadBaseEndpoint flagext.URLValue
+	ReadTimeout      time.Duration
+
+	RequestDebug bool
+	UserAgent    string
+
+	// ClusterValidationLabel optionally defines the cluster validation label that should be sent with HTTP requests.
+	ClusterValidationLabel string
+}
+
+func (cfg *ClientConfig) RegisterFlags(f *flag.FlagSet) {
+	f.StringVar(&cfg.TenantID, "tests.tenant-id", defaultTenant, "The tenant ID to use to write and read metrics in tests.")
+	f.StringVar(&cfg.BasicAuthUser, "tests.basic-auth-user", "", "The username to use for HTTP bearer authentication. (mutually exclusive with bearer-token flag)")
+	f.StringVar(&cfg.BasicAuthPassword, "tests.basic-auth-password", "", "The password to use for HTTP bearer authentication. (mutually exclusive with bearer-token flag)")
+	f.StringVar(&cfg.BearerToken, "tests.bearer-token", "", "The bearer token to use for HTTP bearer authentication. (mutually exclusive with basic-auth flags)")
+
+	f.Var(&cfg.WriteBaseEndpoint, "tests.write-endpoint", "The base endpoint on the write path. The URL should have no trailing slash. The specific API path is appended by the tool to the URL, for example /api/v1/push for the remote write API endpoint, so the configured URL must not include it.")
+	f.IntVar(&cfg.WriteBatchSize, "tests.write-batch-size", 1000, "The maximum number of series to write in a single request.")
+	f.DurationVar(&cfg.WriteTimeout, "tests.write-timeout", 5*time.Second, "The timeout for a single write request.")
+	f.StringVar(&cfg.WriteProtocol, "tests.write-protocol", "prometheus", "The protocol to use to write series data. Supported values are: prometheus, prometheus2, otlp-http")
+
+	f.Var(&cfg.ReadBaseEndpoint, "tests.read-endpoint", "The base endpoint on the read path. The URL should have no trailing slash. The specific API path is appended by the tool to the URL, for example /api/v1/query_range for range query API, so the configured URL must not include it.")
+	f.DurationVar(&cfg.ReadTimeout, "tests.read-timeout", 60*time.Second, "The timeout for a single read request.")
+	f.BoolVar(&cfg.RequestDebug, "tests.send-chunks-debugging-header", false, "Request debugging on the server side via header.")
+	f.StringVar(&cfg.UserAgent, "tests.client.user-agent", defaultUserAgent, "The value the Mimir client should send in the User-Agent header.")
+	f.StringVar(&cfg.ClusterValidationLabel, "tests.client.cluster-validation.label", "", "Optionally define the cluster validation label.")
+}
+
+type Client struct {
+	protocol    string
+	writeClient clientWriter
+	readClient  v1.API
+	cfg         ClientConfig
+	logger      log.Logger
+}
+
+type clientWriter interface {
+	sendWriteRequest(ctx context.Context, req *prompb.WriteRequest) (int, error)
+}
+
+func NewClient(cfg ClientConfig, logger log.Logger, reg prometheus.Registerer) (*Client, error) {
+	rt := http.DefaultTransport
+	if cfg.ClusterValidationLabel != "" {
+		invalidClusterLabels := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Name: "mimir_continuous_test_client_invalid_cluster_validation_label_requests_total",
+			Help: "Number of requests with invalid cluster validation label.",
+			ConstLabels: map[string]string{
+				"protocol": "http",
+			},
+		}, []string{"method"})
+		invalidClusterLabelReporter := func(msg string, method string) {
+			level.Warn(logger).Log("msg", msg, "method", method, "cluster_validation_label", cfg.ClusterValidationLabel)
+			invalidClusterLabels.WithLabelValues(method).Inc()
+		}
+		rt = middleware.ClusterValidationRoundTripper(cfg.ClusterValidationLabel, invalidClusterLabelReporter, rt)
+		level.Info(logger).Log("msg", "including cluster validation header with HTTP requests", "cluster_validation_label", cfg.ClusterValidationLabel)
+	} else {
+		level.Info(logger).Log("msg", "not including cluster validation header with HTTP requests")
+	}
+
+	rt = &clientRoundTripper{
+		tenantID:          cfg.TenantID,
+		basicAuthUser:     cfg.BasicAuthUser,
+		basicAuthPassword: cfg.BasicAuthPassword,
+		bearerToken:       cfg.BearerToken,
+		rt:                otelhttp.NewTransport(rt),
+		requestDebug:      cfg.RequestDebug,
+		userAgent:         cfg.UserAgent,
+	}
+
+	// Ensure the required config has been set.
+	if cfg.WriteBaseEndpoint.URL == nil {
+		return nil, errors.New("the write endpoint has not been set")
+	}
+	if cfg.ReadBaseEndpoint.URL == nil {
+		return nil, errors.New("the read endpoint has not been set")
+	}
+
+	// Ensure not multiple auth methods set at the same time
+	// Allow tenantID and auth to be defined at the same time for tenant testing
+	// anonymous is the default value for TenantID.
+	if (cfg.TenantID != defaultTenant && cfg.BasicAuthUser != "" && cfg.BasicAuthPassword != "" && cfg.BearerToken != "") || // all authentication at once
+		(cfg.BasicAuthUser != "" && cfg.BasicAuthPassword != "" && cfg.BearerToken != "") { // basic auth and bearer token
+		return nil, errors.New("either set tests.tenant-id or tests.basic-auth-user/tests.basic-auth-password or tests.bearer-token")
+	}
+
+	var writeClient clientWriter
+
+	switch cfg.WriteProtocol {
+	case "prometheus":
+		writeClient = &prometheusWriter{
+			httpClient:        &http.Client{Transport: rt},
+			writeBaseEndpoint: cfg.WriteBaseEndpoint,
+			writeBatchSize:    cfg.WriteBatchSize,
+			writeTimeout:      cfg.WriteTimeout,
+		}
+
+	case "prometheus2":
+		writeClient = &prometheus2Writer{
+			httpClient:        &http.Client{Transport: rt},
+			writeBaseEndpoint: cfg.WriteBaseEndpoint,
+			writeBatchSize:    cfg.WriteBatchSize,
+			writeTimeout:      cfg.WriteTimeout,
+		}
+
+	case "otlp-http":
+		writeClient = &otlpHTTPWriter{
+			httpClient:        &http.Client{Transport: rt},
+			writeBaseEndpoint: cfg.WriteBaseEndpoint,
+			writeBatchSize:    cfg.WriteBatchSize,
+			writeTimeout:      cfg.WriteTimeout,
+		}
+
+	default:
+		return nil, fmt.Errorf("the only supported write protocols are: \"prometheus\", \"prometheus2\", \"otlp-http\"")
+	}
+
+	apiCfg := api.Config{
+		Address:      cfg.ReadBaseEndpoint.String(),
+		RoundTripper: rt,
+	}
+
+	readClient, err := api.NewClient(apiCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create read client: %w", err)
+	}
+
+	return &Client{
+		protocol:    cfg.WriteProtocol,
+		writeClient: writeClient,
+		readClient:  v1.NewAPI(readClient),
+		cfg:         cfg,
+		logger:      logger,
+	}, nil
+}
+
+// QueryRange implements MimirClient.
+func (c *Client) QueryRange(ctx context.Context, query string, start, end time.Time, step time.Duration, options ...RequestOption) (model.Matrix, error) {
+	ctx = contextWithRequestOptions(ctx, options...)
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.ReadTimeout)
+	defer cancel()
+
+	ctx = querierapi.ContextWithReadConsistencyLevel(ctx, querierapi.ReadConsistencyStrong)
+
+	value, _, err := c.readClient.QueryRange(ctx, query, v1.Range{
+		Start: start,
+		End:   end,
+		Step:  step,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if value.Type() != model.ValMatrix {
+		return nil, fmt.Errorf("was expecting to get a Matrix, but got %s", value.Type().String())
+	}
+
+	matrix, ok := value.(model.Matrix)
+	if !ok {
+		return nil, fmt.Errorf("failed to cast type to Matrix, type was %T", value)
+	}
+
+	return matrix, nil
+}
+
+// Query implements MimirClient.
+func (c *Client) Query(ctx context.Context, query string, ts time.Time, options ...RequestOption) (model.Vector, error) {
+	ctx = contextWithRequestOptions(ctx, options...)
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.ReadTimeout)
+	defer cancel()
+
+	ctx = querierapi.ContextWithReadConsistencyLevel(ctx, querierapi.ReadConsistencyStrong)
+
+	value, _, err := c.readClient.Query(ctx, query, ts)
+	if err != nil {
+		return nil, err
+	}
+
+	if value.Type() != model.ValVector {
+		return nil, fmt.Errorf("was expecting to get a Vector, but got %s", value.Type().String())
+	}
+
+	vector, ok := value.(model.Vector)
+	if !ok {
+		return nil, fmt.Errorf("failed to cast type to Vector, type was %T", value)
+	}
+
+	return vector, nil
+}
+
+// Metadata implements MimirClient.
+func (c *Client) Metadata(ctx context.Context, metricName string) (v1.Metadata, error) {
+	result, err := c.readClient.Metadata(ctx, metricName, "1")
+	if err != nil {
+		return v1.Metadata{}, err
+	}
+	m := result[metricName]
+	if len(m) == 0 {
+		return v1.Metadata{}, fmt.Errorf("metadata for metric %q not found", metricName)
+	}
+	return m[0], nil
+}
+
+// WriteSeries implements MimirClient.
+func (c *Client) WriteSeries(ctx context.Context, series []prompb.TimeSeries, metadata []prompb.MetricMetadata) (int, error) {
+	lastStatusCode := 0
+
+	// Honor the batch size.
+	for len(series) > 0 {
+		end := min(len(series), c.cfg.WriteBatchSize)
+		batch := series[0:end]
+		series = series[end:]
+
+		var err error
+		lastStatusCode, err = c.writeClient.sendWriteRequest(ctx, &prompb.WriteRequest{
+			Timeseries: batch,
+			Metadata:   metadata,
+		})
+		if err != nil {
+			return lastStatusCode, err
+		}
+	}
+
+	return lastStatusCode, nil
+}
+
+// Protocol implements MimirClient.
+func (c *Client) Protocol() string {
+	return c.protocol
+}
+
+// RequestOption defines a functional-style request option.
+type RequestOption func(options *requestOptions)
+
+// WithResultsCacheEnabled controls whether the query-frontend results cache should be enabled or disabled for the request.
+// This function assumes query-frontend results cache is enabled by default.
+func WithResultsCacheEnabled(enabled bool) RequestOption {
+	return func(options *requestOptions) {
+		options.resultsCacheDisabled = !enabled
+	}
+}
+
+func WithAdditionalHeaders(headers map[string]string) RequestOption {
+	return func(options *requestOptions) {
+		options.additionalHeaders = headers
+	}
+}
+
+// contextWithRequestOptions returns a context.Context with the request options applied.
+func contextWithRequestOptions(ctx context.Context, options ...RequestOption) context.Context {
+	actual := &requestOptions{}
+	for _, option := range options {
+		option(actual)
+	}
+
+	return context.WithValue(ctx, requestOptionsKey, actual)
+}
+
+type requestOptions struct {
+	resultsCacheDisabled bool
+	additionalHeaders    map[string]string
+}
+
+type key int
+
+var requestOptionsKey key
+
+type clientRoundTripper struct {
+	tenantID          string
+	basicAuthUser     string
+	basicAuthPassword string
+	bearerToken       string
+	rt                http.RoundTripper
+	requestDebug      bool
+	userAgent         string
+}
+
+// RoundTrip adds the tenant ID header required by Mimir.
+func (rt *clientRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	options, _ := req.Context().Value(requestOptionsKey).(*requestOptions)
+	if options != nil {
+		if options.resultsCacheDisabled {
+			// Despite the name, the "no-store" directive also disables results cache lookup in Mimir.
+			req.Header.Set("Cache-Control", "no-store")
+		}
+
+		for k, v := range options.additionalHeaders {
+			req.Header.Set(k, v)
+		}
+	}
+
+	if rt.bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+rt.bearerToken)
+		if rt.tenantID != defaultTenant {
+			req.Header.Set("X-Scope-OrgID", rt.tenantID)
+		}
+	} else if rt.basicAuthUser != "" && rt.basicAuthPassword != "" {
+		req.SetBasicAuth(rt.basicAuthUser, rt.basicAuthPassword)
+		if rt.tenantID != defaultTenant {
+			req.Header.Set("X-Scope-OrgID", rt.tenantID)
+		}
+	} else {
+		req.Header.Set("X-Scope-OrgID", rt.tenantID)
+	}
+
+	if rt.userAgent != "" {
+		req.Header.Set("User-Agent", rt.userAgent)
+	}
+
+	if lvl, ok := querierapi.ReadConsistencyLevelFromContext(req.Context()); ok {
+		req.Header.Add(querierapi.ReadConsistencyHeader, lvl)
+	}
+
+	if rt.requestDebug {
+		req.Header.Add(chunkinfologger.ChunkInfoLoggingHeader, "series_id")
+	}
+
+	return rt.rt.RoundTrip(req)
+}

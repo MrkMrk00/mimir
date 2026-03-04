@@ -1,0 +1,2 @@
+[url "ssh://git@github.com/grafana/mimir-prometheus"]
+	insteadOf = https://github.com/grafana/mimir-prometheus

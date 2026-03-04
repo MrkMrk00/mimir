@@ -1,0 +1,5 @@
+*
+!.gitignore
+!mimir-tsdb
+!mimir-alertmanager
+!mimir-ruler

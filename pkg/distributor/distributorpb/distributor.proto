@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Provenance-includes-location: https://github.com/cortexproject/cortex/blob/master/pkg/distributor/distributorpb/distributor.proto
+// Provenance-includes-license: Apache-2.0
+// Provenance-includes-copyright: The Cortex Authors.
+
+syntax = "proto3";
+
+package distributor;
+
+import "github.com/grafana/mimir/pkg/mimirpb/mimir.proto";
+import "gogoproto/gogo.proto";
+
+option go_package = "distributorpb";
+option (gogoproto.marshaler_all) = true;
+option (gogoproto.unmarshaler_all) = true;
+
+service Distributor {
+  rpc Push(cortexpb.WriteRequest) returns (cortexpb.WriteResponse) {}
+}

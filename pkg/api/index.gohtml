@@ -1,0 +1,41 @@
+{{- /*gotype: github.com/grafana/mimir/pkg/api.indexPageContents */ -}}
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>Grafana Mimir</title>
+
+    <link rel="stylesheet" href="{{ "static/bootstrap-5.1.3.min.css" }}">
+    <link rel="stylesheet" href="{{ "static/mimir-styles.css" }}">
+    <script src="{{ "static/bootstrap-5.1.3.bundle.min.js" }}"></script>
+</head>
+<body>
+<div class="d-flex flex-column container py-3">
+    <div class="header row border-bottom py-3 flex-column-reverse flex-sm-row">
+        <div class="col-12 col-sm-9 text-center text-sm-start">
+            <h1>Grafana Mimir Admin</h1>
+        </div>
+        <div class="col-12 col-sm-3 text-center text-sm-end mb-3 mb-sm-0">
+            <img alt="Mimir logo" class="mimir-brand" src="{{ "static/mimir-icon.png" }}">
+        </div>
+    </div>
+    {{ range $i, $group := .LinkGroups }}
+        <div class="row service-row border-bottom py-3">
+            <div class="col-sm-3 text-start text-sm-end"><h2>{{ $group.Desc }}</h2></div>
+            <div class="col-sm-9">
+                <ul class="my-0 list-unstyled">
+                    {{ range $group.Links }}
+                       <li><a href="{{ resolveBaseURL $.BaseURL .Path }}">{{ .Desc }}</a>
+                            {{ if .Dangerous }}<span
+                                    class="badge bg-danger rounded-pill align-middle">Dangerous</span>{{ end }}</li>
+                    {{ end }}
+                </ul>
+            </div>
+        </div>
+    {{ end }}
+</div>
+</body>
+</html>

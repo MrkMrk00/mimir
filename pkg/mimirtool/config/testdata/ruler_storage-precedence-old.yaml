@@ -1,0 +1,8 @@
+ruler_storage:
+  s3:
+    endpoint: 'http://fallback'
+
+ruler:
+  storage:
+    s3:
+      endpoint: 'http://primary'

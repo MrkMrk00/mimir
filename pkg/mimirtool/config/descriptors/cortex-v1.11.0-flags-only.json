@@ -1,0 +1,125 @@
+{
+  "kind": "block",
+  "name": "",
+  "required": false,
+  "desc": "",
+  "blockEntries": [
+    {
+      "kind": "field",
+      "name": "schema-config-file",
+      "required": false,
+      "desc": "The path to the schema config file. The schema config is used only when running Cortex with the chunks storage.",
+      "fieldDefaultValue": "",
+      "fieldFlag": "schema-config-file",
+      "fieldType": "string"
+    },
+    {
+      "kind": "field",
+      "name": "ingester-chunk-encoding",
+      "required": false,
+      "desc": "Encoding version to use for chunks.",
+      "fieldDefaultValue": "",
+      "fieldFlag": "ingester.chunk-encoding",
+      "fieldType": "string"
+    },
+    {
+      "kind": "field",
+      "name": "querier-query-parallelism",
+      "required": false,
+      "desc": "Max subqueries run in parallel per higher-level query.",
+      "fieldDefaultValue": 100,
+      "fieldFlag": "querier.query-parallelism",
+      "fieldType": "int"
+    },
+    {
+      "kind": "field",
+      "name": "config-file",
+      "required": false,
+      "desc": "Configuration file to load.",
+      "fieldDefaultValue": "",
+      "fieldFlag": "config.file",
+      "fieldType": "string"
+    },
+    {
+      "kind": "field",
+      "name": "config-expand-env",
+      "required": false,
+      "desc": "Expands ${var} or $var in config according to the values of the environment variables.",
+      "fieldDefaultValue": "",
+      "fieldFlag": "config.expand-env",
+      "fieldType": "string"
+    },
+    {
+      "kind": "field",
+      "name": "mem-ballast-size-bytes",
+      "required": false,
+      "desc": "Size of memory ballast to allocate.",
+      "fieldDefaultValue": 0,
+      "fieldFlag": "mem-ballast-size-bytes",
+      "fieldType": "int"
+    },
+    {
+      "kind": "field",
+      "name": "event-sample-rate",
+      "required": false,
+      "desc": "How often to sample observability events (0 = never).",
+      "fieldDefaultValue": 0,
+      "fieldFlag": "event.sample-rate",
+      "fieldType": "int"
+    },
+    {
+      "kind": "field",
+      "name": "ingester-lifecycler-id",
+      "required": false,
+      "desc": "ID to register in the ring.",
+      "fieldDefaultValue": null,
+      "fieldFlag": "ingester.lifecycler.id",
+      "fieldType": "string"
+    },
+    {
+      "kind": "field",
+      "name": "ingester-lifecycler-port",
+      "required": false,
+      "desc": "port to advertise in consul (defaults to server.grpc-listen-port).",
+      "fieldDefaultValue": null,
+      "fieldFlag": "ingester.lifecycler.port",
+      "fieldType": "int"
+    },
+    {
+      "kind": "field",
+      "name": "ingester-client-expected-timeseries",
+      "required": false,
+      "desc": "Expected number of timeseries per request, used for preallocations.",
+      "fieldDefaultValue": 100,
+      "fieldFlag": "ingester-client.expected-timeseries",
+      "fieldType": "int"
+    },
+    {
+      "kind": "field",
+      "name": "ingester-client-expected-labels",
+      "required": false,
+      "desc": "Expected number of labels per timeseries, used for preallocations.",
+      "fieldDefaultValue": 20,
+      "fieldFlag": "ingester-client.expected-labels",
+      "fieldType": "int"
+    },
+    {
+      "kind": "field",
+      "name": "ingester-client-expected-samples-per-series",
+      "required": false,
+      "desc": "Expected number of samples per timeseries, used for preallocations.",
+      "fieldDefaultValue": 10,
+      "fieldFlag": "ingester-client.expected-samples-per-series",
+      "fieldType": "int"
+    },
+    {
+      "kind": "field",
+      "name": "frontend-cache-split-interval",
+      "required": false,
+      "desc": "Deprecated: The maximum interval expected for each request, results will be cached per single interval. This behavior is now determined by querier.split-queries-by-interval.",
+      "fieldDefaultValue": 10,
+      "fieldFlag": "frontend.cache-split-interval",
+      "fieldType": "int"
+    }
+  ]
+}

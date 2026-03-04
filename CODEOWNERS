@@ -1,0 +1,34 @@
+# Default owners for everything in the repo, unless a later match takes precedence.
+* @grafana/mimir-maintainers
+
+# Documentation.
+/.github/workflows/deploy-pr-preview.yml                                    @grafana/docs-tooling @grafana/mimir-maintainers
+/.github/workflows/publish-technical-documentation-next.yml                 @grafana/docs-tooling @grafana/mimir-maintainers
+/.github/workflows/publish-technical-documentation-release-helm-charts.yml  @grafana/docs-tooling @grafana/mimir-maintainers
+/.github/workflows/publish-technical-documentation-release-mimir.yml        @grafana/docs-tooling @grafana/mimir-maintainers
+/.github/workflows/update-make-docs.yml                                     @grafana/docs-tooling @grafana/mimir-maintainers
+
+/docs/                                                                      @tacole02 @grafana/mimir-maintainers
+/docs/docs.mk                                                               @grafana/docs-tooling @grafana/mimir-maintainers
+/docs/internal/                                                             @grafana/mimir-maintainers
+/docs/make-docs                                                             @grafana/docs-tooling @grafana/mimir-maintainers
+/docs/proposals/                                                            @grafana/mimir-maintainers
+/docs/variables.mk                                                          @grafana/docs-tooling @grafana/mimir-maintainers
+
+# Alertmanager and ruler.
+/pkg/alertmanager/ @grafana/mimir-ruler-and-alertmanager-maintainers @grafana/mimir-maintainers
+/pkg/ruler/ @grafana/mimir-ruler-and-alertmanager-maintainers @grafana/mimir-maintainers
+
+# Packages.
+/Makefile @wilfriedroset @vaxvms @bubu11e @grafana/mimir-maintainers
+/packaging/ @wilfriedroset @vaxvms @bubu11e @grafana/mimir-maintainers
+
+# No owners - allows sub-maintainers to merge changes.
+CHANGELOG.md
+
+# Dependencies
+go.mod @stevesg @grafana/mimir-maintainers
+go.sum @stevesg @grafana/mimir-maintainers
+/vendor/ @stevesg @grafana/mimir-maintainers
+/vendor/github.com/prometheus/alertmanager @grafana/mimir-ruler-and-alertmanager-maintainers @grafana/mimir-maintainers
+/vendor/github.com/grafana/alerting @grafana/mimir-ruler-and-alertmanager-maintainers @grafana/mimir-maintainers

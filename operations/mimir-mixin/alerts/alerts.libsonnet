@@ -1,0 +1,1124 @@
+local utils = import 'mixin-utils/utils.libsonnet';
+
+(import 'alerts-utils.libsonnet') {
+  // simpleRegexpOpt produces a simple regexp that matches all strings in the input array.
+  local simpleRegexpOpt(strings) =
+    assert std.isArray(strings) : 'simpleRegexpOpt requires that `strings` is an array of strings`';
+    '(' + std.join('|', strings) + ')',
+
+  local excludeWorkloads(labelName, values) =
+    if std.length(values) == 0 then '' else '{%s!~"%s"}' % [labelName, std.join('|', values)],
+
+  local groupDeploymentByRolloutGroup(metricName, ignore) =
+    'sum without(deployment) (label_replace(%s%s, "rollout_group", "$1", "deployment", "(.*?)(?:-zone-[a-z])?"))' % [
+      metricName,
+      excludeWorkloads('deployment', ignore),
+    ],
+
+  local groupStatefulSetByRolloutGroup(metricName, ignore) =
+    'sum by (%s, rollout_group) (label_replace(%s%s, "rollout_group", "$1", "statefulset", "(.*?)(?:-zone-[a-z])?"))' % [
+      $._config.alert_aggregation_labels,
+      metricName,
+      excludeWorkloads('statefulset', ignore),
+    ],
+
+  local groupStatefulSetByRolloutGroupAndRevision(metricName, ignore) =
+    'sum by (%s, rollout_group, revision) (label_replace(%s%s, "rollout_group", "$1", "statefulset", "(.*?)(?:-zone-[a-z])?"))' % [
+      $._config.alert_aggregation_labels,
+      metricName,
+      excludeWorkloads('statefulset', ignore),
+    ],
+
+  local request_metric = 'cortex_request_duration_seconds',
+
+  local rate(error_query, total_query, comment='') = |||
+    %(comment)s(
+      %(errorQuery)s
+      /
+      %(totalQuery)s
+    ) * 100 > 1
+  ||| % { comment: comment, errorQuery: error_query, totalQuery: total_query },
+
+  local requestErrorsQuery(selector, error_selector, rate_interval, sum_by, comment='') =
+    local errorSelector = '%s, %s' % [error_selector, selector];
+    local errorQuery = utils.ncHistogramSumBy(utils.ncHistogramCountRate(request_metric, errorSelector, rate_interval), sum_by);
+    local totalQuery = utils.ncHistogramSumBy(utils.ncHistogramCountRate(request_metric, selector, rate_interval), sum_by);
+    {
+      classic: rate(errorQuery.classic, totalQuery.classic, comment),
+      native: rate(errorQuery.native, totalQuery.native, comment),
+    },
+
+  local requestErrorsAlert(histogram_type) = {
+    local query = requestErrorsQuery(
+      selector='route!~"%s"' % std.join('|', ['ready'] + $._config.alert_excluded_routes),
+      // Note if alert_aggregation_labels is "job", this will repeat the label. But
+      // prometheus seems to tolerate that.
+      error_selector='status_code=~"5..", status_code!~"529|598"',
+      rate_interval=$.alertRangeInterval(1),
+      sum_by=[$._config.alert_aggregation_labels, $._config.per_job_label, 'route'],
+      comment=|||
+        # The following 5xx errors considered as non-error:
+        # - 529: used by distributor rate limiting (using 529 instead of 429 to let the client retry)
+        # - 598: used by GEM gateway when the client is very slow to send the request and the gateway times out reading the request body
+      |||,
+    ),
+    alert: $.alertName('RequestErrors'),
+    expr: query[histogram_type],
+    'for': '15m',
+    labels: $.histogramLabels({ severity: 'critical' }, histogram_type, nhcb=false),
+    annotations: {
+                   message: |||
+                     The route {{ $labels.route }} in %(alert_aggregation_variables)s is experiencing {{ printf "%%.2f" $value }}%% errors.
+                   ||| % $._config,
+                 }
+                 // Alternative dashboards for investigation:
+                 //   - Mimir / Reads (mimir-reads.json) - for read path errors
+                 //   - Mimir / Alertmanager (mimir-alertmanager.json) - for alertmanager errors
+                 //   - Mimir / Alertmanager Resources (mimir-alertmanager-resources.json) - for resource starvation
+                 + $.dashboardURLAnnotation('mimir-writes.json'),
+  },
+
+  local rulerRemoteEvaluationFailingAlert(histogram_type) = {
+    local query = requestErrorsQuery(
+      selector='route="/httpgrpc.HTTP/Handle", %s' % $.jobMatcher($._config.job_names.ruler_query_frontend),
+      error_selector='status_code=~"5.."',
+      rate_interval=$.alertRangeInterval(5),
+      sum_by=[$._config.alert_aggregation_labels],
+    ),
+    alert: $.alertName('RulerRemoteEvaluationFailing'),
+    expr: query[histogram_type],
+    'for': '5m',
+    labels: $.histogramLabels({ severity: 'warning' }, histogram_type, nhcb=false),
+    annotations: {
+                   message: |||
+                     %(product)s rulers in %(alert_aggregation_variables)s are failing to perform {{ printf "%%.2f" $value }}%% of remote evaluations through the ruler-query-frontend.
+                   ||| % $._config,
+                 }
+                 // Alternative dashboards for investigation:
+                 //   - Mimir / Remote ruler reads resources (mimir-remote-ruler-reads-resources.json)
+                 + $.dashboardURLAnnotation('mimir-remote-ruler-reads.json'),
+  },
+
+  local kvStoreFailure(histogram_type) = {
+    alert: $.alertName('KVStoreFailure'),
+    local sum_by = [$._config.alert_aggregation_labels, $._config.per_instance_label, 'status_code', 'kv_name'],
+    local range_interval = $.alertRangeInterval(1),
+    local numerator = utils.ncHistogramSumBy(utils.ncHistogramCountRate('cortex_kv_request_duration_seconds', 'status_code!~"2.+"', rate_interval=range_interval, from_recording=false), sum_by),
+    local denominator = utils.ncHistogramSumBy(utils.ncHistogramCountRate('cortex_kv_request_duration_seconds', '', rate_interval=range_interval, from_recording=false), sum_by),
+    expr: |||
+      (
+        %(numerator)s
+        /
+        %(denominator)s
+      )
+      # We want to get alerted only in case there's a constant failure.
+      == 1
+    ||| % {
+      numerator: numerator[histogram_type],
+      denominator: denominator[histogram_type],
+    },
+    'for': '5m',
+    labels: $.histogramLabels({ severity: 'critical' }, histogram_type, nhcb=false),
+    annotations: {
+      message: |||
+        %(product)s %(alert_instance_variable)s in  %(alert_aggregation_variables)s is failing to talk to the KV store {{ $labels.kv_name }}.
+      ||| % $._config,
+    },
+  },
+
+  local alertGroups = [
+    {
+      name: 'mimir_alerts',
+      rules: [
+        {
+          alert: $.alertName('IngesterUnhealthy'),
+          'for': '15m',
+          expr: |||
+            min by (%s) (cortex_ring_members{state="Unhealthy", name="ingester"}) > 0
+          ||| % $._config.alert_aggregation_labels,
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: '%(product)s cluster %(alert_aggregation_variables)s has {{ printf "%%f" $value }} unhealthy ingester(s).' % $._config,
+          },
+        },
+        requestErrorsAlert('classic'),
+        requestErrorsAlert('native'),
+        {
+          alert: $.alertName('RequestLatency'),
+          expr: |||
+            %(group_prefix_jobs)s_route:cortex_request_duration_seconds:99quantile{route!~"%(excluded_routes)s"}
+              >
+            %(cortex_p99_latency_threshold_seconds)s
+          ||| % $._config {
+            excluded_routes: std.join('|', [
+              'metrics',
+              '/frontend.Frontend/Process',
+              'ready',
+              '/schedulerpb.SchedulerForFrontend/FrontendLoop',
+              '/schedulerpb.SchedulerForQuerier/QuerierLoop',
+            ] + $._config.alert_excluded_routes),
+          },
+          'for': '15m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+                         message: |||
+                           {{ $labels.%(per_job_label)s }} {{ $labels.route }} is experiencing {{ printf "%%.2f" $value }}s 99th percentile latency.
+                         ||| % $._config,
+                       }
+                       // Alternative dashboards for investigation:
+                       //   - Mimir / Scaling (mimir-scaling.json) - for scaling decisions
+                       //   - Mimir / Reads (mimir-reads.json) - for read path latency
+                       //   - Mimir / Slow Queries (mimir-slow-queries.json) - to identify slow queries
+                       //   - Mimir / Queries (mimir-queries.json) - for queue length analysis
+                       //   - Mimir / Alertmanager (mimir-alertmanager.json) - for alertmanager path
+                       + $.dashboardURLAnnotation('mimir-writes.json'),
+        },
+        {
+          alert: $.alertName('InconsistentRuntimeConfig'),
+          expr: |||
+            count(count by(%(alert_aggregation_labels)s, %(per_job_label)s, sha256) (cortex_runtime_config_hash)) without(sha256) > 1
+          ||| % $._config,
+          'for': '1h',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: |||
+              An inconsistent runtime config file is used across cluster %(alert_aggregation_variables)s.
+            ||| % $._config,
+          },
+        },
+        {
+          alert: $.alertName('BadRuntimeConfig'),
+          expr: |||
+            # The metric value is reset to 0 on error while reloading the config at runtime.
+            cortex_runtime_config_last_reload_successful == 0
+          |||,
+          // Alert quicker for human errors.
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: |||
+              {{ $labels.%(per_job_label)s }} failed to reload runtime config.
+            ||| % $._config,
+          },
+        },
+        {
+          alert: $.alertName('SchedulerQueriesStuck'),
+          expr: |||
+            sum by (%(group_by)s, %(job_label)s) (min_over_time(cortex_query_scheduler_queue_length[%(range_interval)s])) > 0
+          ||| % {
+            group_by: $._config.alert_aggregation_labels,
+            job_label: $._config.per_job_label,
+            range_interval: $.alertRangeInterval(1),
+          },
+          'for': '7m',  // We don't want to block for longer.
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+                         message: |||
+                           There are {{ $value }} queued up queries in %(alert_aggregation_variables)s {{ $labels.%(per_job_label)s }}.
+                         ||| % $._config,
+                       }
+                       // Alternative dashboards for investigation:
+                       //   - Mimir / Remote ruler reads (mimir-remote-ruler-reads.json)
+                       //   - Mimir / Reads Resources (mimir-reads-resources.json)
+                       //   - Mimir / Slow Queries (mimir-slow-queries.json)
+                       + $.dashboardURLAnnotation('mimir-reads.json'),
+        },
+        {
+          alert: $.alertName('CacheRequestErrors'),
+          // Specifically exclude "add" and "delete" operations which are used for cache invalidation and "locking"
+          // since they are expected to sometimes fail in normal operation (such as when a "lock" already exists or
+          // key being invalidated does not exist). We also only alert when there at least 10 req/sec to the cache
+          // to avoid flapping alerts in low-traffic environments.
+          expr: |||
+            (
+              sum by(%(group_by)s, name, operation) (
+                rate(thanos_cache_operation_failures_total{operation!~"add|delete"}[%(range_interval)s])
+              )
+              /
+              sum by(%(group_by)s, name, operation) (
+                rate(thanos_cache_operations_total{operation!~"add|delete"}[%(range_interval)s])
+              ) > 10
+            ) * 100 > 5
+          ||| % {
+            group_by: $._config.alert_aggregation_labels,
+            range_interval: $.alertRangeInterval(1),
+          },
+          'for': '5m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              The cache {{ $labels.name }} used by %(product)s %(alert_aggregation_variables)s is experiencing {{ printf "%%.2f" $value }}%% errors for {{ $labels.operation }} operation.
+            ||| % $._config,
+          },
+        },
+        {
+          alert: $.alertName('IngesterRestarts'),
+          expr: |||
+            (
+              sum by(%(alert_aggregation_labels)s, %(per_instance_label)s) (
+                increase(kube_pod_container_status_restarts_total{container=~"(%(ingester)s)"}[30m])
+              )
+              >= 2
+            )
+            and
+            (
+              count by(%(alert_aggregation_labels)s, %(per_instance_label)s) (cortex_build_info) > 0
+            )
+          ||| % $._config {
+            ingester: $._config.container_names.ingester,
+          },
+          labels: {
+            // This alert is on a cause not symptom. A couple of ingesters restarts may be suspicious but
+            // not necessarily an issue (eg. may happen because of the K8S node autoscaler), so we're
+            // keeping the alert as warning as a signal in case of an outage.
+            severity: 'warning',
+          },
+          annotations: {
+            message: '%(product)s %(alert_instance_variable)s in %(alert_aggregation_variables)s has restarted {{ printf "%%.2f" $value }} times in the last 30 mins.' % $._config,
+          },
+        },
+        kvStoreFailure('classic'),
+        kvStoreFailure('native'),
+        {
+          alert: $.alertName('MemoryMapAreasTooHigh'),
+          expr: |||
+            process_memory_map_areas{%(job_regex)s} / process_memory_map_areas_limit{%(job_regex)s} > 0.8
+          ||| % { job_regex: $.jobMatcher($._config.job_names.ingester + $._config.job_names.store_gateway) },
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: '{{ $labels.%(per_job_label)s }}/%(alert_instance_variable)s has a number of mmap-ed areas close to the limit.' % $._config,
+          },
+        },
+        {
+          // Alert if an ingester instance has no tenants assigned while other instances in the same cell do.
+          alert: $.alertName('IngesterInstanceHasNoTenants'),
+          'for': '1h',
+          expr: |||
+            (
+              (min by(%(alert_aggregation_labels)s, %(per_instance_label)s) (cortex_ingester_memory_users) == 0)
+              unless
+              (max by(%(alert_aggregation_labels)s, %(per_instance_label)s) (cortex_lifecycler_read_only) > 0)
+            )
+            and on (%(alert_aggregation_labels)s)
+            # Only if there are more timeseries than would be expected due to continuous testing load
+            (
+              ( # Classic storage timeseries
+                sum by(%(alert_aggregation_labels)s) (cortex_ingester_memory_series)
+                /
+                max by(%(alert_aggregation_labels)s) (cortex_distributor_replication_factor)
+              )
+              or
+              ( # Ingest storage timeseries
+                sum by(%(alert_aggregation_labels)s) (
+                  max by(ingester_id, %(alert_aggregation_labels)s) (
+                    label_replace(cortex_ingester_memory_series,
+                      "ingester_id", "$1",
+                      "%(per_instance_label)s", ".*-([0-9]+)$"
+                    )
+                  )
+                )
+              )
+            ) > 100000
+          ||| % $._config,
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: '%(product)s ingester %(alert_instance_variable)s in %(alert_aggregation_variables)s has no tenants assigned.' % $._config,
+          },
+        },
+        {
+          // Alert if a ruler instance has no rule groups assigned while other instances in the same cell do.
+          alert: $.alertName('RulerInstanceHasNoRuleGroups'),
+          'for': '1h',
+          expr: |||
+            # Alert on ruler instances in microservices mode that have no rule groups assigned,
+            min by(%(alert_aggregation_labels)s, %(per_instance_label)s) (cortex_ruler_managers_total{%(per_instance_label)s=~"%(rulerInstanceName)s"}) == 0
+            # but only if other ruler instances of the same cell do have rule groups assigned
+            and on (%(alert_aggregation_labels)s)
+            (max by(%(alert_aggregation_labels)s) (cortex_ruler_managers_total) > 0)
+            # and there are more than two instances overall
+            and on (%(alert_aggregation_labels)s)
+            (count by (%(alert_aggregation_labels)s) (cortex_ruler_managers_total) > 2)
+          ||| % {
+            alert_aggregation_labels: $._config.alert_aggregation_labels,
+            per_instance_label: $._config.per_instance_label,
+            rulerInstanceName: $._config.instance_names.ruler,
+          },
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: '%(product)s ruler %(alert_instance_variable)s in %(alert_aggregation_variables)s has no rule groups assigned.' % $._config,
+          },
+        },
+        {
+          // Alert if a ruler instance has no rule groups assigned while other instances in the same cell do.
+          alert: $.alertName('IngestedDataTooFarInTheFuture'),
+          'for': '5m',
+          expr: |||
+            max by(%(alert_aggregation_labels)s, %(per_instance_label)s) (
+                cortex_ingester_tsdb_head_max_timestamp_seconds - time()
+                and
+                cortex_ingester_tsdb_head_max_timestamp_seconds > 0
+            ) > 60*60
+          ||| % {
+            alert_aggregation_labels: $._config.alert_aggregation_labels,
+            per_instance_label: $._config.per_instance_label,
+          },
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: '%(product)s ingester %(alert_instance_variable)s in %(alert_aggregation_variables)s has ingested samples with timestamps more than 1h in the future.' % $._config,
+          },
+        },
+        {
+          alert: $.alertName('StoreGatewayTooManyFailedOperations'),
+          'for': '5m',
+          expr: |||
+            sum by(%(alert_aggregation_labels)s, operation) (rate(thanos_objstore_bucket_operation_failures_total{component="store-gateway"}[%(range_interval)s])) > 0
+          ||| % {
+            alert_aggregation_labels: $._config.alert_aggregation_labels,
+            range_interval: $.alertRangeInterval(1),
+          },
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+                         message: '%(product)s store-gateway in %(alert_aggregation_variables)s is experiencing {{ $value | humanizePercentage }} errors while doing {{ $labels.operation }} on the object storage.' % $._config,
+                       }
+                       // Alternative dashboards for investigation:
+                       //   - Mimir / Compactor (mimir-compactor.json)
+                       //   - Mimir / Reads Resources (mimir-reads-resources.json)
+                       //   - Mimir / Tenants (mimir-tenants.json)
+                       + $.dashboardURLAnnotation('mimir-object-store.json'),
+        },
+        {
+          // Alert if servers are receiving requests with invalid cluster validation labels (i.e. meant for other clusters).
+          alert: $.alertName('ServerInvalidClusterLabelRequests'),
+          expr: |||
+            (sum by (%(alert_aggregation_labels)s, protocol) (rate(cortex_server_invalid_cluster_validation_label_requests_total{}[%(range_interval)s]))) > 0
+            # Alert only for namespaces with Mimir clusters.
+            and on (%(alert_aggregation_labels)s) (mimir_build_info > 0)
+          ||| % $._config {
+            range_interval: $.alertRangeInterval(5),
+          },
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: '%(product)s servers in %(alert_aggregation_variables)s are receiving requests with invalid cluster validation labels.' % $._config,
+          },
+        },
+        {
+          // Alert if clients' requests are rejected due to invalid cluster validation labels (i.e. there's a mismatch between clients' and servers' cluster validation labels).
+          alert: $.alertName('ClientInvalidClusterLabelRequests'),
+          expr: |||
+            (sum by (%(alert_aggregation_labels)s, protocol) (rate(cortex_client_invalid_cluster_validation_label_requests_total{}[%(range_interval)s]))) > 0
+            # Alert only for namespaces with Mimir clusters.
+            and on (%(alert_aggregation_labels)s) (mimir_build_info > 0)
+          ||| % $._config {
+            range_interval: $.alertRangeInterval(5),
+          },
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: '%(product)s clients in %(alert_aggregation_variables)s are having requests rejected due to invalid cluster validation labels.' % $._config,
+          },
+        },
+        {
+          alert: $.alertName('RingMembersMismatch'),
+          expr: |||
+            (
+              avg by(%(alert_aggregation_labels)s) (sum by(%(alert_aggregation_labels)s, %(per_instance_label)s) (cortex_ring_members{name="ingester",%(job_regex)s,%(job_not_regex)s}))
+              != sum by(%(alert_aggregation_labels)s) (up{%(job_regex)s,%(job_not_regex)s})
+            )
+            and
+            (
+              count by(%(alert_aggregation_labels)s) (cortex_build_info) > 0
+            )
+          ||| % {
+            alert_aggregation_labels: $._config.alert_aggregation_labels,
+            per_instance_label: $._config.per_instance_label,
+            job_regex: $.jobMatcher($._config.job_names.ingester),
+
+            // Exclude temporarily partition ingesters used during the migration to ingest storage.
+            // We exclude them because they will build a different ring, still named "ingester" but
+            // stored under a different prefix in the KV store.
+            job_not_regex: $.jobNotMatcher($._config.job_names.ingester_partition),
+          },
+          'for': '15m',
+          labels: {
+            component: 'ingester',
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              Number of members in %(product)s ingester hash ring does not match the expected number in %(alert_aggregation_variables)s.
+            ||| % { alert_aggregation_variables: $._config.alert_aggregation_variables, product: $._config.product },
+          },
+        },
+
+        {
+          alert: $.alertName('HighGRPCStreamsPerConnection'),
+          expr: |||
+            max(avg_over_time(grpc_concurrent_streams_by_conn_max[10m])) by (%(alert_aggregation_labels)s, container)
+            /
+            min(cortex_grpc_concurrent_streams_limit) by (%(alert_aggregation_labels)s, container) > 0.9
+          ||| % {
+            alert_aggregation_labels: $._config.alert_aggregation_labels,
+          },
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              Container {{ $labels.container }} in %(alert_aggregation_variables)s is experiencing high GRPC concurrent streams per connection.
+            ||| % $._config,
+          },
+        },
+
+        {
+          alert: $.alertName('MixedQuerierQueryPlanVersionSupport'),
+          expr: |||
+            min by (%(alert_aggregation_labels)s, %(per_query_path_label)s) (cortex_querier_maximum_supported_query_plan_version)
+            !=
+            max by (%(alert_aggregation_labels)s, %(per_query_path_label)s) (cortex_querier_maximum_supported_query_plan_version)
+          ||| % $._config,
+          'for': '15m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              Queriers in the same %(product)s cluster and query path are reporting different maximum supported query plan versions.
+            |||,
+          },
+        },
+
+        {
+          alert: $.alertName('MixedQueryFrontendQueryPlanVersionSupport'),
+          expr: |||
+            min by (%(alert_aggregation_labels)s, %(per_query_path_label)s) (cortex_query_frontend_querier_ring_calculated_maximum_supported_query_plan_version)
+            !=
+            max by (%(alert_aggregation_labels)s, %(per_query_path_label)s) (cortex_query_frontend_querier_ring_calculated_maximum_supported_query_plan_version)
+          ||| % $._config,
+          'for': '15m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              Query-frontends in the same %(product)s cluster and query path have calculated different maximum supported query plan versions.
+            ||| % $._config,
+          },
+        },
+
+        {
+          alert: $.alertName('QueryFrontendsAndQueriersDisagreeOnSupportedQueryPlanVersion'),
+          expr: |||
+            # The label_replace calls below are so that we can match queriers with container labels like "ruler-querier" to
+            # query-frontends with container labels like "ruler-query-frontend".
+            # We support having the querier/query-frontend part as both a prefix and a suffix to support situations where the
+            # query path name appears at the beginning (eg. "ruler-querier") or at the end (eg. "querier-mqe-test").
+
+            min by (%(alert_aggregation_labels)s, query_path) (
+              label_replace(
+                cortex_querier_maximum_supported_query_plan_version,
+                "query_path", "$2", "%(per_query_path_label)s", "(querier)?-?(.*)-?(querier)?"
+              )
+            )
+            !=
+            min by (%(alert_aggregation_labels)s, query_path) (
+              label_replace(
+                # Exclude the case where query-frontends failed to compute a maximum supported query plan version altogether (reporting -1), as
+                # that is covered by the QueryFrontendNotComputingSupportedQueryPlanVersion alert.
+                cortex_query_frontend_querier_ring_calculated_maximum_supported_query_plan_version != -1,
+                "query_path", "$2", "%(per_query_path_label)s", "(query-frontend)?-?(.*)-?(query-frontend)?"
+              )
+            )
+          ||| % $._config,
+          'for': '15m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              Query-frontends and queriers are reporting different maximum supported query plan versions.
+            ||| % $._config,
+          },
+        },
+
+        {
+          alert: $.alertName('QueryFrontendNotComputingSupportedQueryPlanVersion'),
+          expr: |||
+            count by (%(alert_aggregation_labels)s, %(per_query_path_label)s) (cortex_query_frontend_querier_ring_calculated_maximum_supported_query_plan_version == -1) > 0
+          ||| % $._config,
+          'for': '5m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              Query-frontends are failing to compute a maximum supported query plan version.
+            ||| % $._config,
+          },
+        },
+      ],
+    },
+    {
+      name: 'mimir_instance_limits_alerts',
+      rules: [
+        {
+          alert: $.alertName('IngesterReachingSeriesLimit'),
+          expr: |||
+            (
+                (cortex_ingester_memory_series / ignoring(limit) cortex_ingester_instance_limits{limit="max_series"})
+                and ignoring (limit)
+                (cortex_ingester_instance_limits{limit="max_series"} > 0)
+            ) > 0.8
+          |||,
+          'for': '3h',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              Ingester {{ $labels.%(per_job_label)s }}/%(alert_instance_variable)s has reached {{ $value | humanizePercentage }} of its series limit.
+            ||| % $._config,
+          } + $.dashboardURLAnnotation('mimir-writes-resources.json'),
+        },
+        {
+          alert: $.alertName('IngesterReachingSeriesLimit'),
+          expr: |||
+            (
+                (cortex_ingester_memory_series / ignoring(limit) cortex_ingester_instance_limits{limit="max_series"})
+                and ignoring (limit)
+                (cortex_ingester_instance_limits{limit="max_series"} > 0)
+            ) > 0.9
+          |||,
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: |||
+              Ingester {{ $labels.%(per_job_label)s }}/%(alert_instance_variable)s has reached {{ $value | humanizePercentage }} of its series limit.
+            ||| % $._config,
+          } + $.dashboardURLAnnotation('mimir-writes-resources.json'),
+        },
+        {
+          alert: $.alertName('IngesterReachingTenantsLimit'),
+          expr: |||
+            (
+                (cortex_ingester_memory_users / ignoring(limit) cortex_ingester_instance_limits{limit="max_tenants"})
+                and ignoring (limit)
+                (cortex_ingester_instance_limits{limit="max_tenants"} > 0)
+            ) > 0.7
+          |||,
+          'for': '5m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              Ingester {{ $labels.%(per_job_label)s }}/%(alert_instance_variable)s has reached {{ $value | humanizePercentage }} of its tenant limit.
+            ||| % $._config,
+          } + $.dashboardURLAnnotation('mimir-writes-resources.json'),
+        },
+        {
+          alert: $.alertName('IngesterReachingTenantsLimit'),
+          expr: |||
+            (
+                (cortex_ingester_memory_users / ignoring(limit) cortex_ingester_instance_limits{limit="max_tenants"})
+                and ignoring (limit)
+                (cortex_ingester_instance_limits{limit="max_tenants"} > 0)
+            ) > 0.8
+          |||,
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: |||
+              Ingester {{ $labels.%(per_job_label)s }}/%(alert_instance_variable)s has reached {{ $value | humanizePercentage }} of its tenant limit.
+            ||| % $._config,
+          } + $.dashboardURLAnnotation('mimir-writes-resources.json'),
+        },
+        {
+          alert: $.alertName('ReachingTCPConnectionsLimit'),
+          expr: |||
+            cortex_tcp_connections / cortex_tcp_connections_limit > 0.8 and
+            cortex_tcp_connections_limit > 0
+          |||,
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: |||
+              %(product)s instance {{ $labels.%(per_job_label)s }}/%(alert_instance_variable)s has reached {{ $value | humanizePercentage }} of its TCP connections limit for {{ $labels.protocol }} protocol.
+            ||| % $._config,
+          } + $.dashboardURLAnnotation('mimir-writes.json'),
+        },
+        {
+          alert: $.alertName('DistributorInflightRequestsHigh'),
+          expr: |||
+            (
+                (cortex_distributor_inflight_push_requests / ignoring(limit) cortex_distributor_instance_limits{limit="max_inflight_push_requests"})
+                and ignoring (limit)
+                (cortex_distributor_instance_limits{limit="max_inflight_push_requests"} > 0)
+            ) > 0.8
+          |||,
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: |||
+              Distributor {{ $labels.%(per_job_label)s }}/%(alert_instance_variable)s has reached {{ $value | humanizePercentage }} of its inflight push request limit.
+            ||| % $._config,
+          } + $.dashboardURLAnnotation('mimir-writes-resources.json'),
+        },
+      ],
+    },
+    {
+      local statefulset_rollout_stuck(for_duration, severity) = {
+        alert: $.alertName('RolloutStuck'),
+        expr: |||
+          (
+            # Query for rollout groups in certain namespaces that are being updated, dropping the revision label.
+            max by (%(aggregation_labels)s, rollout_group) (
+              %(kube_statefulset_status_current_revision)s
+                unless
+              %(kube_statefulset_status_update_revision)s
+            )
+              # Multiply by replicas in corresponding rollout groups not fully updated to the current revision.
+              *
+            (
+              %(kube_statefulset_replicas)s
+                !=
+              %(kube_statefulset_status_replicas_updated)s
+            )
+          ) and (
+            # Pick only those which are unchanging for the interval.
+            changes(%(kube_statefulset_status_replicas_updated)s[%(range_interval)s])
+              ==
+            0
+          )
+          # Include only Mimir namespaces.
+          * on(%(aggregation_labels)s) group_left max by(%(aggregation_labels)s) (cortex_build_info)
+        ||| % {
+          aggregation_labels: $._config.alert_aggregation_labels,
+          // Indicates the revision of the StatefulSet used to generate current replicas.
+          kube_statefulset_status_current_revision: groupStatefulSetByRolloutGroupAndRevision('kube_statefulset_status_current_revision', $._config.rollout_stuck_alert_ignore_statefulsets),
+          // Indicates the revision of the StatefulSet used to generate replicas being updated.
+          kube_statefulset_status_update_revision: groupStatefulSetByRolloutGroupAndRevision('kube_statefulset_status_update_revision', $._config.rollout_stuck_alert_ignore_statefulsets),
+          kube_statefulset_replicas: groupStatefulSetByRolloutGroup('kube_statefulset_replicas', $._config.rollout_stuck_alert_ignore_statefulsets),
+          kube_statefulset_status_replicas_updated: groupStatefulSetByRolloutGroup('kube_statefulset_status_replicas_updated', $._config.rollout_stuck_alert_ignore_statefulsets),
+          range_interval: '15m:' + $.alertRangeInterval(1),
+        },
+        'for': for_duration,
+        labels: {
+          severity: severity,
+          workload_type: 'statefulset',
+        },
+        annotations: {
+          message: |||
+            The {{ $labels.rollout_group }} rollout is stuck in %(alert_aggregation_variables)s.
+          ||| % $._config,
+        },
+      },
+
+      local deployment_rollout_stuck(for_duration, severity) = {
+        alert: $.alertName('RolloutStuck'),
+        expr: |||
+          (
+            %(kube_deployment_spec_replicas)s
+              !=
+            %(kube_deployment_status_replicas_updated)s
+          ) and (
+            changes(%(kube_deployment_status_replicas_updated)s[%(range_interval)s])
+              ==
+            0
+          )
+          * on(%(aggregation_labels)s) group_left max by(%(aggregation_labels)s) (cortex_build_info)
+        ||| % {
+          aggregation_labels: $._config.alert_aggregation_labels,
+          kube_deployment_spec_replicas: groupDeploymentByRolloutGroup('kube_deployment_spec_replicas', $._config.rollout_stuck_alert_ignore_deployments),
+          kube_deployment_status_replicas_updated: groupDeploymentByRolloutGroup('kube_deployment_status_replicas_updated', $._config.rollout_stuck_alert_ignore_deployments),
+          range_interval: '15m:' + $.alertRangeInterval(1),
+        },
+        'for': for_duration,
+        labels: {
+          severity: severity,
+          workload_type: 'deployment',
+        },
+        annotations: {
+          message: |||
+            The {{ $labels.rollout_group }} rollout is stuck in %(alert_aggregation_variables)s.
+          ||| % $._config,
+        },
+      },
+
+
+      name: 'mimir-rollout-alerts',
+      rules: [
+        statefulset_rollout_stuck('30m', 'warning'),
+        statefulset_rollout_stuck('6h', 'critical'),
+        deployment_rollout_stuck('30m', 'warning'),
+        deployment_rollout_stuck('6h', 'critical'),
+
+        {
+          alert: 'RolloutOperatorNotReconciling',
+          expr: |||
+            max by(%s, rollout_group) (time() - rollout_operator_last_successful_group_reconcile_timestamp_seconds) > 600
+          ||| % $._config.alert_aggregation_labels,
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: |||
+              Rollout operator is not reconciling the rollout group {{ $labels.rollout_group }} in %(alert_aggregation_variables)s.
+            ||| % $._config,
+          },
+        },
+      ],
+    },
+    {
+      name: 'mimir-provisioning',
+      rules: [
+        {
+          alert: $.alertName('AllocatingTooMuchMemory'),
+          expr: $._config.ingester_alerts[$._config.deployment_type].memory_allocation % $._config {
+            threshold: '0.65',
+            ingester: $._config.container_names.ingester,
+          },
+          'for': '15m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+                         message: |||
+                           Instance %(alert_instance_variable)s in %(alert_aggregation_variables)s is using too much memory.
+                         ||| % $._config,
+                       }
+                       // Alternative dashboards for investigation:
+                       //   - Mimir / Scaling (mimir-scaling.json) - for scaling recommendations
+                       + $.dashboardURLAnnotation('mimir-writes-resources.json'),
+        },
+        {
+          alert: $.alertName('AllocatingTooMuchMemory'),
+          expr: $._config.ingester_alerts[$._config.deployment_type].memory_allocation % $._config {
+            threshold: '0.8',
+            ingester: $._config.container_names.ingester,
+          },
+          'for': '15m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+                         message: |||
+                           Instance %(alert_instance_variable)s in %(alert_aggregation_variables)s is using too much memory.
+                         ||| % $._config,
+                       }
+                       // Alternative dashboards for investigation:
+                       //   - Mimir / Scaling (mimir-scaling.json) - for scaling recommendations
+                       + $.dashboardURLAnnotation('mimir-writes-resources.json'),
+        },
+      ],
+    },
+    {
+      name: 'ruler_alerts',
+      rules: [
+        {
+          alert: $.alertName('RulerTooManyFailedPushes'),
+          expr: |||
+            100 * (
+            # Here it matches on empty "reason" for backwards compatibility, with when the metric didn't have this label.
+            sum by (%(alert_aggregation_labels)s, %(per_instance_label)s) (rate(cortex_ruler_write_requests_failed_total{reason=~"(error|^$)"}[%(range_interval)s]))
+              /
+            sum by (%(alert_aggregation_labels)s, %(per_instance_label)s) (rate(cortex_ruler_write_requests_total[%(range_interval)s]))
+            ) > 1
+          ||| % $._config {
+            range_interval: $.alertRangeInterval(1),
+          },
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: |||
+              %(product)s Ruler %(alert_instance_variable)s in %(alert_aggregation_variables)s is experiencing {{ printf "%%.2f" $value }}%% write (push) errors.
+            ||| % $._config,
+          },
+        },
+        {
+          alert: $.alertName('RulerTooManyFailedQueries'),
+          expr: |||
+            100 * (
+            # Here it matches on empty "reason" for backwards compatibility, with when the metric didn't have this label.
+            sum by (%(alert_aggregation_labels)s, %(per_instance_label)s) (rate(cortex_ruler_queries_failed_total{reason=~"(error|^$)"}[%(range_interval)s]))
+              /
+            sum by (%(alert_aggregation_labels)s, %(per_instance_label)s) (rate(cortex_ruler_queries_total[%(range_interval)s]))
+            ) > 1
+          ||| % $._config {
+            range_interval: $.alertRangeInterval(1),
+          },
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+                         message: |||
+                           %(product)s Ruler %(alert_instance_variable)s in %(alert_aggregation_variables)s is experiencing {{ printf "%%.2f" $value }}%% errors while evaluating rules.
+                         ||| % $._config,
+                       }
+                       // Alternative dashboards for investigation:
+                       //   - Mimir / Remote ruler reads resources (mimir-remote-ruler-reads-resources.json)
+                       + $.dashboardURLAnnotation('mimir-remote-ruler-reads.json'),
+        },
+        {
+          alert: $.alertName('RulerMissedEvaluations'),
+          expr: |||
+            100 * (
+            sum by (%(alert_aggregation_labels)s, %(per_instance_label)s, rule_group) (rate(cortex_prometheus_rule_group_iterations_missed_total[%(range_interval)s]))
+              /
+            sum by (%(alert_aggregation_labels)s, %(per_instance_label)s, rule_group) (rate(cortex_prometheus_rule_group_iterations_total[%(range_interval)s]))
+            ) > 1
+          ||| % $._config {
+            range_interval: $.alertRangeInterval(1),
+          },
+          'for': '5m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: |||
+              %(product)s Ruler %(alert_instance_variable)s in %(alert_aggregation_variables)s is experiencing {{ printf "%%.2f" $value }}%% missed iterations for the rule group {{ $labels.rule_group }}.
+            ||| % $._config,
+          },
+        },
+        {
+          alert: $.alertName('RulerFailedRingCheck'),
+          expr: |||
+            sum by (%(alert_aggregation_labels)s, %(per_job_label)s) (rate(cortex_ruler_ring_check_errors_total[%(range_interval)s]))
+               > 0
+          ||| % $._config {
+            range_interval: $.alertRangeInterval(1),
+          },
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: |||
+              %(product)s Rulers in %(alert_aggregation_variables)s are experiencing errors when checking the ring for rule group ownership.
+            ||| % $._config,
+          },
+        },
+        rulerRemoteEvaluationFailingAlert('classic'),
+        rulerRemoteEvaluationFailingAlert('native'),
+      ],
+    },
+    {
+      name: 'gossip_alerts',
+      rules: [
+        {
+          // What's the purpose of this alert? We want to know if two databases' Memberlist clusters have merged.
+          // We do this by comparing the reported number of cluster members with the expected number of members based on the number of running pods in that namespace.
+          // If two Memberlist clusters have merged, then the reported number of members will be higher than the expected number.
+          // However, during rollouts, the number of reported cluster members can be higher than the expected number because it takes some time for the removal of old
+          // pods to be propagated to all members of the cluster, so we add a fudge factor of 10 extra members.
+          // This value is designed to be low enough that the alert will trigger if another cluster merges with this one (assuming that most clusters have more than 10
+          // members), but high enough to not result in false positives during rollouts.
+          // We don't use a percentage because this would not be reliable: in a large Mimir cluster of 1000+ instances, even a small percentage like 5% would be 50
+          // instances - too high to catch a small cluster merging with a big one.
+          alert: $.alertName('GossipMembersTooHigh'),
+          expr:
+            |||
+              max by (%s) (memberlist_client_cluster_members_count)
+              >
+              (sum by (%s) (up{%s}) + 10)
+            ||| % [$._config.alert_aggregation_labels, $._config.alert_aggregation_labels, $.jobMatcher($._config.job_names.ring_members)],
+          'for': '20m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: 'One or more %(product)s instances in %(alert_aggregation_variables)s consistently sees a higher than expected number of gossip members.' % $._config,
+          },
+        },
+        {
+          // What's the purpose of this alert? We want to know if a cell has reached a split brain scenario.
+          // We do this by comparing the reported number of cluster members with the expected number of members based on the number of running pods in that namespace.
+          // If a split has occurred, then the reported number of members will be lower than the expected number.
+          alert: $.alertName('GossipMembersTooLow'),
+          expr:
+            |||
+              min by (%s) (memberlist_client_cluster_members_count)
+              <
+              (sum by (%s) (up{%s=~".+/%s"}) * 0.5)
+            ||| % [$._config.alert_aggregation_labels, $._config.alert_aggregation_labels, $._config.per_job_label, simpleRegexpOpt($._config.job_names.ring_members)],
+          'for': '20m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: 'One or more %(product)s instances in %(alert_aggregation_variables)s consistently sees a lower than expected number of gossip members.' % $._config,
+          },
+        },
+        {
+          // Alert if the list of endpoints returned by the gossip-ring service (used as memberlist seed nodes)
+          // is out-of-sync. This is a warning alert with 10% out-of-sync threshold.
+          alert: $.alertName('GossipMembersEndpointsOutOfSync'),
+          expr:
+            |||
+              (
+                count by(%(alert_aggregation_labels)s) (
+                  kube_endpoint_address{endpoint="gossip-ring"}
+                  unless on (%(alert_aggregation_labels)s, ip)
+                  label_replace(kube_pod_info, "ip", "$1", "pod_ip", "(.*)"))
+                /
+                count by(%(alert_aggregation_labels)s) (
+                  kube_endpoint_address{endpoint="gossip-ring"}
+                )
+                * 100 > 10
+              )
+
+              # Filter by Mimir only.
+              and (count by(%(alert_aggregation_labels)s) (cortex_build_info) > 0)
+            ||| % $._config,
+          'for': '15m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: '%(product)s gossip-ring service endpoints list in %(alert_aggregation_variables)s is out of sync.' % $._config,
+          },
+        },
+        {
+          // Alert if the list of endpoints returned by the gossip-ring service (used as memberlist seed nodes)
+          // is out-of-sync. This is a critical alert with 50% out-of-sync threshold.
+          alert: $.alertName('GossipMembersEndpointsOutOfSync'),
+          expr:
+            |||
+              (
+                count by(%(alert_aggregation_labels)s) (
+                  kube_endpoint_address{endpoint="gossip-ring"}
+                  unless on (%(alert_aggregation_labels)s, ip)
+                  label_replace(kube_pod_info, "ip", "$1", "pod_ip", "(.*)"))
+                /
+                count by(%(alert_aggregation_labels)s) (
+                  kube_endpoint_address{endpoint="gossip-ring"}
+                )
+                * 100 > 50
+              )
+
+              # Filter by Mimir only.
+              and (count by(%(alert_aggregation_labels)s) (cortex_build_info) > 0)
+            ||| % $._config,
+          'for': '5m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: '%(product)s gossip-ring service endpoints list in %(alert_aggregation_variables)s is out of sync.' % $._config,
+          },
+        },
+        {
+          // Alert if there's no available memberlist-bridge pod in any of the zones where it's deployed.
+          alert: $.alertName('MemberlistBridgeZoneUnavailable'),
+          expr: |||
+            # Find the expected memberlist-bridge zonal deployments.
+            count by (%(alert_aggregation_labels)s, zone) (
+                label_replace(
+                    kube_deployment_spec_replicas{deployment=~"memberlist-bridge-zone-[abc]"} > 0,
+                    "zone", "$1", "deployment", "memberlist-bridge-(zone-[abc])"
+                )
+            )
+            # Excluding zones where there is at least 1 healthy memberlist-bridge.
+            unless (
+                count by(%(alert_aggregation_labels)s, zone) (
+                    label_replace(
+                        kube_pod_status_ready{pod=~"memberlist-bridge-zone-[abc]-.*", condition="true"} == 1,
+                        "zone", "$1", "pod", "memberlist-bridge-(zone-[abc]).*"
+                    )
+                ) > 0
+            )
+          ||| % $._config,
+          'for': '10m',
+          labels: {
+            severity: 'critical',
+          },
+          annotations: {
+            message: '%(product)s memberlist-bridge in %(alert_aggregation_variables)s {{ $labels.zone }} has no available pods.' % $._config,
+          },
+        },
+        {
+          alert: $.alertName('MemberlistZoneAwareRoutingAutoFailover'),
+          expr: |||
+            sum by (%(alert_aggregation_labels)s) (rate(memberlist_client_zone_aware_routing_select_nodes_skipped_total[1m])) > 0
+          ||| % $._config,
+          'for': '10m',
+          labels: {
+            severity: 'warning',
+          },
+          annotations: {
+            message: '%(product)s memberlist in %(alert_aggregation_variables)s has automatically temporarily disabled zone-aware routing because it detected missing memberlist bridges.' % $._config,
+          },
+        },
+      ],
+    },
+    {
+      name: 'golang_alerts',
+      rules: (
+        [
+          {
+            alert: $.alertName('GoThreadsTooHigh'),
+            expr: |||
+              # We filter by the namespace because go_threads can be very high cardinality in a large organization.
+              max by(%(alert_aggregation_labels)s, %(per_instance_label)s) (go_threads{job=~".*(cortex|mimir).*"} > %(threshold)s)
+
+              # Further filter on namespaces actually running Mimir.
+              and on (%(alert_aggregation_labels)s) (count by (%(alert_aggregation_labels)s) (cortex_build_info))
+            ||| % ($._config + settings),
+            'for': '15m',
+            labels: {
+              severity: settings.severity,
+            },
+            annotations: {
+              message: |||
+                %(product)s %(alert_instance_variable)s in %(alert_aggregation_variables)s is running a very high number of Go threads.
+              ||| % $._config,
+            },
+          }
+          for settings in [
+            { severity: 'warning', threshold: 5000 },
+            { severity: 'critical', threshold: 8000 },
+          ]
+        ]
+      ),
+    },
+  ],
+
+  groups+: $.withRunbookURL('https://grafana.com/docs/mimir/latest/operators-guide/mimir-runbooks/#%s', $.withExtraLabelsAnnotations(alertGroups)),
+}

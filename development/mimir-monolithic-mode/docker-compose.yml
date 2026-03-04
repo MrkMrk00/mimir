@@ -1,0 +1,153 @@
+services:
+
+  consul:
+    image: consul:1.15  # latest tag not supported
+    command: [ "agent", "-dev" ,"-client=0.0.0.0", "-log-level=info" ]
+    ports:
+      - 8510:8500
+
+  minio:
+    image: minio/minio:RELEASE.2025-05-24T17-08-30Z
+    command: [ "server", "--console-address", ":9101", "/data" ]
+    environment:
+      - MINIO_ROOT_USER=mimir
+      - MINIO_ROOT_PASSWORD=supersecret
+    ports:
+      - 9100:9100
+      - 9101:9101
+    volumes:
+      - .data-minio:/data:delegated
+
+  prometheus:
+    profiles:
+      - prometheus
+    image: prom/prometheus:v3.10.0@sha256:4a61322ac1103a0e3aea2a61ef1718422a48fa046441f299d71e660a3bc71ae9
+    command: ["--config.file=/etc/prometheus/prometheus.yaml"]
+    volumes:
+      - ./config:/etc/prometheus
+    ports:
+      - 9190:9090
+
+  prometheusRW2:
+    profiles:
+      - prometheusRW2
+    image: prom/prometheus:v3.10.0@sha256:4a61322ac1103a0e3aea2a61ef1718422a48fa046441f299d71e660a3bc71ae9
+    command:
+      - "--config.file=/etc/prometheus/prometheusRW2.yaml"
+    volumes:
+      - ./config:/etc/prometheus
+    ports:
+      - 9192:9090
+
+  grafana:
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    image: grafana/grafana:12.4.0@sha256:b0ae311af06228bcfd4a620504b653db80f5b91e94dc3dc2a5b7dab202bcde20
+    ports:
+      - 3000:3000
+    volumes:
+      - ./config/datasource-mimir.yaml:/etc/grafana/provisioning/datasources/mimir.yaml
+
+  # Scrape the metrics also with the Grafana agent (useful to test metadata ingestion
+  # until metadata remote write is supported by Prometheus).
+  grafana-agent:
+    profiles:
+      - grafana-agent-static
+    image: grafana/agent:v0.44.7@sha256:7a944ee1274e54b84fcadc4e1e53f88cfedb566d911fedd4cf1e9c695df8c989
+    command: ["-config.file=/etc/agent-config/grafana-agent.yaml", "-metrics.wal-directory=/tmp", "-server.http.address=127.0.0.1:9091"]
+    volumes:
+      - ./config:/etc/agent-config
+    ports:
+      - 9191:9091
+
+  grafana-alloy:
+    profiles:
+      - grafana-alloy
+    image: grafana/alloy:v1.13.2@sha256:8abcd0d97a97099cabb34be8dcfc448fca6c35931ae9291aaf74056105dedcca
+    command: ["run", "--server.http.listen-addr=0.0.0.0:9092", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./config/config.alloy:/etc/alloy/config.alloy
+    ports:
+      - 9092:9092
+
+  jaeger:
+    # Use 1.62 specifically since 1.63 removes the agent which we depend on for now.
+    image: jaegertracing/all-in-one:1.62.0
+    ports:
+      - 16681:16686
+      - "14268"
+
+  mimir-1:
+    build:
+      context:    .
+      dockerfile: dev.dockerfile
+    image: mimir
+    command: ["sh", "-c", "sleep 3 && exec ./mimir -config.file=./config/mimir.yaml -target=all -server.http-listen-port=8001 -server.grpc-listen-port=9101"]
+    depends_on:
+      - consul
+      - minio
+    environment:
+      - JAEGER_AGENT_HOST=jaeger
+      - JAEGER_AGENT_PORT=6831
+      - JAEGER_TAGS=app=mimir-1
+      - JAEGER_SAMPLER_TYPE=const
+      - JAEGER_SAMPLER_PARAM=1
+    ports:
+      - 8101:8001
+    volumes:
+      - ./config:/mimir/config
+      - .data-mimir-1:/data:delegated
+
+  mimir-2:
+    build:
+      context:    .
+      dockerfile: dev.dockerfile
+    image: mimir
+    command: ["sh", "-c", "sleep 3 && exec ./mimir -config.file=./config/mimir.yaml -target=all -server.http-listen-port=8002 -server.grpc-listen-port=9002"]
+    depends_on:
+      - consul
+      - minio
+    environment:
+      - JAEGER_AGENT_HOST=jaeger
+      - JAEGER_AGENT_PORT=6831
+      - JAEGER_TAGS=app=mimir-2
+      - JAEGER_SAMPLER_TYPE=const
+      - JAEGER_SAMPLER_PARAM=1
+    ports:
+      - 8102:8002
+    volumes:
+      - ./config:/mimir/config
+      - .data-mimir-2:/data:delegated
+
+  otel-remote-write:
+    image: otel/opentelemetry-collector-contrib:0.146.1@sha256:f6e429c1052ab50f85a7afa5f7e32f25931697751622b0e1f453d10f79a1df3c
+    command: ["--config=file:/etc/otelcol-contrib/config.yaml", "--feature-gates", "receiver.prometheusreceiver.EnableNativeHistograms,receiver.prometheusreceiver.RemoveStartTimeAdjustment"]
+    profiles:
+      - otel-collector-remote-write
+    volumes:
+      - ./config/otel-collector-remote-write-config.yaml:/etc/otelcol-contrib/config.yaml
+    ports: # From https://opentelemetry.io/docs/collector/getting-started/
+      - 1888:1888 # pprof extension
+      - 8888:8888 # Prometheus metrics exposed by the collector
+      - 8889:8889 # Prometheus exporter metrics
+      - 13133:13133 # health_check extension
+      - 4317:4317 # OTLP gRPC receiver
+      - 4318:4318 # OTLP http receiver
+      - 55679:55679 # zpages extension
+
+  otel-otlp:
+    image: otel/opentelemetry-collector-contrib:0.146.1@sha256:f6e429c1052ab50f85a7afa5f7e32f25931697751622b0e1f453d10f79a1df3c
+    command: ["--config=file:/etc/otelcol-contrib/config.yaml", "--feature-gates", "receiver.prometheusreceiver.EnableNativeHistograms,receiver.prometheusreceiver.RemoveStartTimeAdjustment"]
+    profiles:
+      - otel-collector-otlp-push
+    volumes:
+      - ./config/otel-collector-otlp-push-config.yaml:/etc/otelcol-contrib/config.yaml
+    ports: # From https://opentelemetry.io/docs/collector/getting-started/
+      - 1888:1888 # pprof extension
+      - 8888:8888 # Prometheus metrics exposed by the collector
+      - 8889:8889 # Prometheus exporter metrics
+      - 13133:13133 # health_check extension
+      - 4317:4317 # OTLP gRPC receiver
+      - 4318:4318 # OTLP http receiver
+      - 55679:55679 # zpages extension
