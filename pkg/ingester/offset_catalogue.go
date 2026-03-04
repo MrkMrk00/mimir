@@ -75,7 +75,8 @@ func (c *offsetCatalogue) Sync(ctx context.Context) error {
 	spanLogger, ctx := spanlogger.New(ctx, c.logger, tracer, "Ingester.OffsetCatalogue.Sync")
 	defer spanLogger.Finish()
 
-	lastSeenOffset := c.offsetReader.LastSeenOffset()
+	// If block was cut from the head and discovered in this sync, all its series are guaranteed to come from below this offset.
+	offsetHW := c.offsetReader.LastSeenOffset()
 
 	oldData, err := readOffsetCatalogueFromFile(c.dir)
 	if err != nil {
@@ -100,25 +101,25 @@ func (c *offsetCatalogue) Sync(ctx context.Context) error {
 		Data:    make(map[string]offsetWatermark, len(blocks)),
 	}
 	for id := range blocks {
-		if wmk, ok := oldData.Data[id]; ok {
+		if mark, ok := oldData.Data[id]; ok {
 			// If block already exists in the previous catalogue, keep it.
-			data.Data[id] = wmk
+			data.Data[id] = mark
 			continue
 		}
-		wmk, ok := catalogueData[id]
-		if !ok || wmk.Offset < 0 {
+		mark, ok := catalogueData[id]
+		if !ok || mark.Offset < 0 {
 			// If block wasn't found in the catalogue (e.g. block existed before start),
-			// or block's watermark offset wasn't captured, fallback to the most recent lastSeenOffset.
-			// This is conservative: if block was found on disk, its data came from offset lower than current lastSeenOffset.
-			wmk = offsetWatermark{
+			// or block's watermark offset wasn't captured, fallback to the most recent offsetHW.
+			// This is conservative: if block was found on disk, its data came from offset lower than current offsetHW.
+			mark = offsetWatermark{
 				Partition: c.partition,
-				Offset:    lastSeenOffset,
+				Offset:    offsetHW,
 			}
-		} else if wmk.Offset > lastSeenOffset {
-			level.Warn(spanLogger).Log("msg", "found unexpected offset watermark", "user", c.userID, "block", id, "partition", wmk.Partition, "offset", wmk.Offset, "last_seen_offset", lastSeenOffset)
+		} else if mark.Offset > offsetHW {
+			level.Warn(spanLogger).Log("msg", "found unexpected offset watermark", "user", c.userID, "block", id, "partition", mark.Partition, "offset", mark.Offset, "last_seen_offset", offsetHW)
 			continue
 		}
-		data.Data[id] = wmk
+		data.Data[id] = mark
 	}
 
 	if err := writeOffsetCatalogueToFile(c.logger, c.dir, data); err != nil {
@@ -164,12 +165,12 @@ func writeOffsetCatalogueToFile(logger log.Logger, dir string, data offsetCatalo
 }
 
 func (c *offsetCatalogue) SetOffset(key string, offset int64) {
-	wmk := offsetWatermark{
+	mark := offsetWatermark{
 		Partition: c.partition,
 		Offset:    offset,
 	}
 	c.mu.Lock()
-	c.data[key] = wmk
+	c.data[key] = mark
 	c.mu.Unlock()
 }
 
