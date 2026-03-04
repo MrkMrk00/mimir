@@ -3695,6 +3695,8 @@ func (i *Ingester) offsetCataloguesSync(ctx context.Context) {
 
 	// If any block was cut from the head and discovered in this sync tick,
 	// all series in the block are guaranteed to come from below this lastSeenOffset.
+	// Note: for normal compaction cycle, that cuts head at "chunkRange * 3/2",
+	// this offset overshoots by ~1h. This is technically correct, but very conservative.
 	offsetHW := i.ingestReader.LastSeenOffset()
 
 	_ = concurrency.ForEachUser(ctx, i.getTSDBUsers(), i.cfg.BlocksStorageConfig.TSDB.OffsetCatalogue.SyncConcurrency, func(ctx context.Context, userID string) error {
