@@ -41,6 +41,10 @@ type offsetCatalogueData struct {
 	Data    map[string]offsetWatermark `json:"data"`
 }
 
+type offsetReader interface {
+	LastSeenOffset() int64
+}
+
 type offsetCatalogue struct {
 	logger log.Logger
 	dir    string
@@ -187,10 +191,6 @@ func tsdbCompactorFactory(db *userTSDB, catalogue *offsetCatalogue) tsdb.NewComp
 
 		return tsdbCompactor, nil
 	}
-}
-
-type offsetReader interface {
-	LastSeenOffset() int64
 }
 
 // tsdbCompactor wraps a tsdb.Compactor to record the Kafka offset watermark for each newly compacted block
